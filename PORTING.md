@@ -255,6 +255,52 @@ native-Wayland SWELL release), rebuild it as a **separate, focused test
 harness** rather than re-embedding branches like these in
 `smooth_wheel_scroll.cpp` itself.
 
+## Stock XWayland: manual smoke test -- PASS
+
+Full manual pass of the live-test checklist above, done by hand (not
+automated), against:
+
+- **Exact commit:** `7e5c5dbbed56a22d460aa9bf885f314245e516b0` (`7e5c5db`),
+  clean working tree (`git status` empty at test time).
+- **Artifact:** `build/reaper_smoothwheelscroll-x86_64.so`, built with
+  `./build-linux.sh --debug-log`.
+  SHA-256: `97bd8d323922363f773d33e5d9651c9136bfd105805f43895d2cb905667f9873`
+- **Host:** REAPER 7.78, stock `libSwell.so`, running through XWayland
+  (`GDK_BACKEND=x11`) under a Plasma Wayland session -- the
+  `~/reaper_native_wayland_test/stock/REAPER` portable install (see the
+  native-Wayland section above for what this rig is).
+
+Results, all PASS:
+
+| # | Item | Result |
+|---|---|---|
+| 1 | Arrange scroll/zoom, vertical + horizontal | PASS |
+| 2 | Repeated fast/slow notched-wheel movement, direction changes | PASS |
+| 3 | MIDI editor scroll/zoom | PASS |
+| 4 | "One page" actions stay native (one notch = one page, tested via Alt+Shift+Mousewheel on "View: Scroll view vertically one page (MIDI CC relative/mousewheel)") | PASS |
+| 5 | Parameter wheels (faders/knobs) unaffected | PASS |
+| 6 | Keyboard/script(Run)-triggered actions -- do they unexpectedly glide? | PASS as *documented option-C behavior*: running "View: Zoom horizontally (MIDI CC relative/mousewheel)" from the Action List glides exactly like a wheel notch, since Linux has no wheel-vs-other-trigger admission gate (see "The v1 decision on the latch" above). Confirmed expected, not a new defect. |
+| 7 | No continued movement or log activity after input stops | PASS -- checked directly against `/tmp/SmoothWheelScroll.log`: last glide-related line tapered to a sub-unit value and stopped; over a minute of subsequent silence (one unrelated "View: Toggle mixer visible" pass-through line aside, correctly logged as un-touched) |
+| 8 | TCP panel / MIDI piano keys / mixer surfaces | PASS as *expected v1 limitation*: all three respond instantly/natively, not smoothed -- these surfaces were driven by the Windows-only `WH_GETMESSAGE` hook (see "What 'Windows-only surroundings' means" above), which has no Linux port. Confirmed as expected, not treated as a bug to fix immediately. |
+
+**Explicit v1 limitations reconfirmed by this pass** (not defects, both already
+documented above): (a) option-C admission -- keyboard- or Run-triggered
+invocations of the classified actions glide the same as a wheel notch would,
+because Linux has no equivalent of the Windows wheel-latch gate; (b) TCP
+panel, mixer, and MIDI piano-key surfaces are not ported and behave exactly
+as native REAPER, unsmoothed.
+
+**Native Wayland**: still unsupported pending further diagnosis (see "Known
+issue" above) -- unaffected by this pass, which was run on stock/XWayland
+only.
+
+**Cleanup confirmed** after this test: REAPER process stopped and verified
+gone (`pgrep -x reaper` empty), the test artifact removed from
+`stock/REAPER/UserPlugins`, and all three environments checked clean
+afterward -- `stock/REAPER/UserPlugins`, `native/REAPER/UserPlugins`
+(untouched throughout), and the regular `~/.config/REAPER/UserPlugins`
+(untouched throughout).
+
 ## macOS
 
 Not started. Once Linux is verified, the plan is: same source (the
