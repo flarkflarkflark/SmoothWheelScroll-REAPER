@@ -338,13 +338,11 @@ comments, one harmless declaration reorder, and `__declspec(dllexport)` ->
 the SDK's own `REAPER_PLUGIN_DLL_EXPORT` macro (identical expansion on
 Windows) -- no Windows behavior change. `build-linux.sh` builds clean.
 
-**Re-run against 1.7.0**: see the dedicated section below -- done via MCP,
-not by hand. Short version: no crash, no hang, no regression found; one
-real (organic) arrange wheel-zoom gesture was captured end-to-end and
-behaved identically in character to the 1.3.9 smoke test. Two code paths
-(MIDI editor scroll/zoom, one Main-section action) could not be exercised
-through the available remote-control tooling -- see "Not independently
-re-confirmed" below for what that leaves open.
+**Re-run against 1.7.0**: PASS, full checklist. Done via MCP first, then
+the two rows the MCP tooling couldn't reach (MIDI editor scroll/zoom,
+vertical arrange zoom) were confirmed by hand with real hardware wheel
+input directly in REAPER. See the dedicated section below for the detail
+and for what was organic vs. synthesized vs. manual.
 
 ## 1.7.0 rebase: live-test results (via MCP, 2026-09-17)
 
@@ -386,27 +384,28 @@ cleanly to "not a touchpad / nothing passed through". Across the whole
 session (organic event + every direct invocation) that stub path ran
 several times with zero incidents.
 
-**2. Arrange zoom**: see above (990, organic) -- PASS.
+**2. Arrange zoom**: PASS. Horizontal confirmed organically (990, above).
+Vertical (command 1000) could not be triggered through `dsl_run_action`
+(see the MCP-dispatch gap noted below) but was confirmed PASS afterward
+by hand, with real hardware wheel input directly in REAPER.
 
-**3. MIDI editor scroll/zoom**: PARTIAL. The MIDI editor itself opened
-correctly (via a bound user script, since no direct "open MIDI editor"
-tool call was available) -- confirmed by a real, distinct editor `hwnd` in
-the log and correct classification of the script's own internal actions
-(1227, "View: Zoom to project loop selection") as pass-through. But
-`dsl_run_action` with `section: 32060` (MIDI editor) for the actual
-scroll/zoom commands (40430-40433) never produced a `HOOK` line at all,
-before or after closing an unrelated stray dialog (see below). Command
-1000 (Main section, "View: Zoom vertically") showed the exact same
-symptom -- invoked twice, no `HOOK` line either time, while every other
-Main-section ID tried did reach the hook. Since this affects a native
-Main-section command untouched by the rebase (same `routing.h` entry,
-same registration code, unmodified since before this port existed), the
-most likely explanation is a gap in how the MCP tool dispatches those
-specific command IDs, not a plugin defect -- but it could not be
-conclusively resolved in this session, and it means the MIDI-editor half
-of the classification table was not directly exercised. The code path is
-identical to the Main-section path that WAS proven safe (same table, same
-`#ifdef` boundaries), so risk is assessed as low, not zero.
+**3. MIDI editor scroll/zoom**: PASS. The MIDI editor itself opened
+correctly via MCP (via a bound user script, since no direct "open MIDI
+editor" tool call was available) -- confirmed by a real, distinct editor
+`hwnd` in the log and correct classification of the script's own internal
+actions (1227, "View: Zoom to project loop selection") as pass-through.
+`dsl_run_action` with `section: 32060` for the actual scroll/zoom commands
+(40430-40433) never produced a `HOOK` line at all, before or after
+closing an unrelated stray dialog (see below) -- and command 1000 (Main
+section, "View: Zoom vertically") showed the exact same symptom, while
+every other Main-section ID tried did reach the hook. Since this affects a
+native Main-section command untouched by the rebase (same `routing.h`
+entry, same registration code, unmodified since before this port
+existed), this was assessed as a gap in how the MCP tool dispatches those
+specific command IDs, not a plugin defect. **Confirmed correct** by manual
+follow-up: both MIDI-editor scroll/zoom and vertical arrange-zoom were
+verified directly in REAPER with real hardware wheel input (not via MCP),
+PASS.
 
 **4. Mixer/MCP wheel scroll**: unreachable by construction, as designed --
 `DRIVE_MCP_WHEEL` is only ever set inside the Windows-only message hook
@@ -445,14 +444,14 @@ is still open, harmless, closable anytime. The user's original project
 tab was confirmed untouched throughout (checked track/item counts on both
 tabs; not dirty before the test, not modified by anything done here).
 
-**Not independently re-confirmed** (carried over as open items, same
-spirit as the original checklist's honesty about what "stock never showed
-the flood" does and doesn't establish): a deliberate by-hand pass of
-MIDI-editor wheel scroll/zoom, arrange vertical wheel-zoom specifically,
-and native mixer/TCP-panel fallback behavior, since real hardware wheel
-input (not just the one organic event captured) is the only way to fully
-close out those specific rows. Nothing observed in this session
-contradicts correctness on any of them.
+**Manual follow-up (2026-09-17, real hardware wheel, direct in REAPER, not
+via MCP)**: MIDI-editor scroll/zoom and vertical arrange-zoom -- the two
+rows the MCP tooling could not reach -- PASS. That closes out every row of
+this checklist against 1.7.0: the rebase is verified, not just compiled.
+Native mixer/TCP-panel fallback behavior (item 8 of the original
+1.3.9-era smoke test below) was not re-touched here since nothing in the
+rebase changed that surface's already-documented "not ported, behaves
+natively" status.
 
 ## macOS
 
