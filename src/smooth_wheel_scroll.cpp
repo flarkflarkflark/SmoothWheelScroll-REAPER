@@ -5495,11 +5495,60 @@ static void RefreshPanelTheme()
   InvalidateRect(g_cfgWnd, nullptr, TRUE);
 }
 
-// Not yet implemented: the Extensions/other-menu "SmoothScroll..." submenu entry the Windows
-// build adds via OnMenuHook. Registered below (unconditionally, from ReaperPluginEntry) because
-// the registration itself is cheap and platform-agnostic; the menu just never gains an entry on
-// Linux/macOS until this is ported alongside the fader/knob/chart work.
-static void OnMenuHook(const char *, void *, int) {}
+// This IS what puts "SmoothScroll..." into the Extensions menu -- AddExtensionsMainMenu()
+// alone only reserves the slot; REAPER calls back in here (via the "hookcustommenu"
+// registration in ReaperPluginEntry) with the actual HMENU each time a customizable menu is
+// about to be shown, and populating it is entirely this function's job. Ported from the
+// Windows OnMenuHook above with only the SWELL-name differences it actually needs:
+// InsertMenuItemA -> InsertMenuItem, MENUITEMINFOA -> MENUITEMINFO (SWELL has no ANSI/wide
+// split), and MIIM_STRING, which SWELL does not define at all -- dwTypeData is the label
+// unconditionally there, so the bit is simply not needed in fMask.
+#ifndef MIIM_STRING
+#define MIIM_STRING 0
+#endif
+
+static const char *kMenuLabel = "SmoothScroll...";
+
+static bool MenuHasCommand(HMENU hm, int cmd)
+{
+  const int n = GetMenuItemCount(hm);
+  for (int i = 0; i < n; ++i)
+  {
+    if (GetMenuItemID(hm, i) == cmd)
+      return true;
+    HMENU sub = GetSubMenu(hm, i);
+    if (sub && MenuHasCommand(sub, cmd))
+      return true;
+  }
+  return false;
+}
+
+// StrHasI (case-insensitive substring test) already exists, portable, in routing.h -- no
+// platform split needed there; the scoping report's "StrHasI missing" line was wrong, missed
+// by grepping the settings-UI block in isolation rather than the whole file.
+
+static void OnMenuHook(const char *menuidstr, void *menu, int /*flag*/)
+{
+  if (!menu || !g_cmdTune)
+    return;
+  if (!StrHasI(menuidstr, "extension"))
+    return;
+
+  HMENU hm = (HMENU)menu;
+  if (MenuHasCommand(hm, g_cmdTune))
+    return;
+  const bool showing =
+      (g_cfgWnd && IsWindow(g_cfgWnd)) &&
+      ((DockIsChildOfDock && DockIsChildOfDock(g_cfgWnd, nullptr) >= 0) ||
+       IsWindowVisible(g_cfgWnd));
+  MENUITEMINFO mi = {0};
+  mi.cbSize = sizeof(mi);
+  mi.fMask = MIIM_ID | MIIM_STRING | MIIM_STATE;
+  mi.wID = (unsigned int)g_cmdTune;
+  mi.fState = MFS_ENABLED | (showing ? MFS_CHECKED : 0);
+  mi.dwTypeData = (char *)kMenuLabel;
+  InsertMenuItem(hm, GetMenuItemCount(hm), TRUE, &mi);
+}
 
 // Every matched action is left for REAPER to handle normally: there are no child controls yet
 // to steal Tab/Enter/Escape from (see the Windows PanelKeyHandler above for what this becomes

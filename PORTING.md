@@ -504,8 +504,9 @@ as `StopTimer`/`StartTimer`'s Linux bodies elsewhere in this file), a minimal
 dialog proc (`WM_CTLCOLORDLG`/`WM_CTLCOLORSTATIC` for theming,
 `WM_CLOSE`/`WM_DESTROY` for lifecycle), `ShowConfigWindow`/`ToggleConfigWindow`,
 a pass-through `PanelKeyHandler` (no child controls yet to steal keys from),
-and a no-op `OnMenuHook` (the Extensions-menu entry itself works; the separate
-right-click-submenu convenience `OnMenuHook` adds elsewhere is deferred).
+and `OnMenuHook`, ported for real (see "Extensions menu fix" below -- the
+first draft of this phase shipped a no-op here on a wrong assumption about
+what `AddExtensionsMainMenu()` alone does).
 
 **Bug found and fixed during testing, not just claimed to work**: the .rc's
 360x527 are old-style dialog units, and SWELL's non-macOS backend applies a
@@ -550,7 +551,45 @@ the `GWL_WNDPROC`-based subclassing pattern SWS itself uses, since SWELL has
 no `CreateWindowEx` for a custom control class either), `DrawMonitorBlock`
 (needs `TextOut` -> `DrawText`+RECT, `GetTextExtentPoint32A` -> `DT_CALCRECT`,
 `FrameRect` -> 4x`FillRect`, and `PS_DOT` -> manually-drawn dash segments,
-per the scoping report), docking support, and a real `OnMenuHook` port.
+per the scoping report), and docking support.
+
+### Extensions menu fix (same day)
+
+Reported after the phase above shipped: the action worked, but no
+"SmoothScroll..." entry appeared in REAPER's Extensions menu at all.
+
+**Root cause**: wrong assumption in the first draft. `AddExtensionsMainMenu()`
+only reserves this extension a slot in the menu system; actually *populating*
+that slot is entirely `OnMenuHook`'s job -- REAPER calls it back (via the
+`hookcustommenu` registration) with the real `HMENU` each time a
+customizable menu is about to be shown, and it's expected to `InsertMenuItem`
+into it right there. The Phase 2a `OnMenuHook` was a no-op, so nothing ever
+got inserted -- confirmed by adding temporary trace logging (removed again
+once confirmed) rather than guessing: `hookcustommenu` itself fired
+correctly for other menus at load (`"Main toolbar"`, `"Empty TCP area
+toolbar"`, `flag=0`), and `AddExtensionsMainMenu` resolved to a real,
+non-null function pointer -- both processes worked; only the body that was
+supposed to use them didn't exist yet.
+
+**Fix**: ported the real `OnMenuHook` from the Windows side. Needed only the
+same category of change as everything else in this phase --
+`InsertMenuItemA` -> `InsertMenuItem`, `MENUITEMINFOA` -> `MENUITEMINFO`
+(SWELL has no ANSI/wide split) -- plus `MIIM_STRING`, which SWELL doesn't
+define at all; defined locally as `0` since SWELL's `InsertMenuItem` treats
+`dwTypeData` as the label unconditionally, no flag bit needed. `StrHasI`
+(case-insensitive substring match, used to recognise the "Main extensions"
+menu id) turned out to already be portable in `routing.h` -- the scoping
+report's "missing" line for it was wrong, an artifact of grepping the
+settings-UI block in isolation rather than the whole file.
+
+**Verified live, not just compiled**: rebuilt, reinstalled, REAPER
+restarted clean. Debug log showed `hookcustommenu` firing for "Main
+extensions" with `flag=1` each time the user opened it by hand (menu clicks
+couldn't be driven synthetically here either, same as the dialog earlier in
+this phase), and the user confirmed "SmoothScroll..." now appears and opens
+the panel. Temporary trace logging removed afterward; `unifdef -D_WIN32`
+re-confirmed the Windows path is still byte-for-byte identical to
+`linux-port`.
 
 ## macOS
 
