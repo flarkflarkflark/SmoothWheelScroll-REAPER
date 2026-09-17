@@ -338,10 +338,121 @@ comments, one harmless declaration reorder, and `__declspec(dllexport)` ->
 the SDK's own `REAPER_PLUGIN_DLL_EXPORT` macro (identical expansion on
 Windows) -- no Windows behavior change. `build-linux.sh` builds clean.
 
-**Not yet re-run**: the live-test checklist and the stock-XWayland smoke
-test above were both against 1.3.9; they have not been repeated against
-1.7.0's reworked panel/model. Do that before calling the rebased port
-verified.
+**Re-run against 1.7.0**: see the dedicated section below -- done via MCP,
+not by hand. Short version: no crash, no hang, no regression found; one
+real (organic) arrange wheel-zoom gesture was captured end-to-end and
+behaved identically in character to the 1.3.9 smoke test. Two code paths
+(MIDI editor scroll/zoom, one Main-section action) could not be exercised
+through the available remote-control tooling -- see "Not independently
+re-confirmed" below for what that leaves open.
+
+## 1.7.0 rebase: live-test results (via MCP, 2026-09-17)
+
+Driven through REAPER's own `flark-reaper-mcp` bridge (`mcp_bridge.lua`,
+already running against the user's normal REAPER instance) rather than by
+hand. Artifact: `build/reaper_smoothwheelscroll-x86_64.so`, built with
+`./build-linux.sh --debug-log`.
+SHA-256: `98185d3bc2d2740c7b8f7ba066c04f37a2571674a378fa0932050a132c45d213`
+
+**Setup**: installed to `UserPlugins`, REAPER's real running instance
+(stock `GDK_BACKEND=x11` through XWayland, confirmed from its own
+environment -- not the experimental native-Wayland rig from the section
+above) was quit (project was not dirty -- confirmed via
+`dsl_is_project_dirty` first, nothing lost) and relaunched with the same
+captured environment. Bridge was back and answering read-only requests in
+0.5s. Plugin loaded clean: `loaded main=0x...`, correct MMPROBE mouse-
+modifier readout, no errors in REAPER's stdout/stderr.
+
+**1. Arrange scroll/zoom**: PASS, and organically -- not synthesized. ~26s
+after load, a real wheel gesture (cmd=990, "View: Zoom horizontally") came
+through the log with a proper relative-encoded value (val=113,
+relmode=1), producing a clean `HOOK -> MATCH -> kick -> smooth` sequence
+and a burst of `replay` calls at decaying intervals (11ms widening to
+35ms) -- exactly the expected glide taper. Log went silent afterward (70+s
+checked); no continued activity. This is the single strongest piece of
+evidence in this pass: a real user wheel notch exercised the full
+OnAction -> Kick -> Tick -> ReplayAction path on the rebased build with no
+part of that chain flagged by the compiler-verified `#ifdef _WIN32` split.
+
+**Direct-invocation sanity checks** (`dsl_run_action` with `unsafe: true`,
+Main section): commands 988 (scroll-h) and 989 (scroll-v) both reached
+`hookcommand2` and classified correctly. Their `val=0, relmode=0` (this
+tool has no way to pass a real relative-wheel encoding) correctly
+short-circuits the decode (`raw = val & 0x7f == 0`) with no crash --
+which incidentally exercises `TouchpadZoomReverse` /
+`LastWheelPassedThrough` (both stubbed for this rebase, item 5 in the
+original checklist) on every single one of these calls, always resolving
+cleanly to "not a touchpad / nothing passed through". Across the whole
+session (organic event + every direct invocation) that stub path ran
+several times with zero incidents.
+
+**2. Arrange zoom**: see above (990, organic) -- PASS.
+
+**3. MIDI editor scroll/zoom**: PARTIAL. The MIDI editor itself opened
+correctly (via a bound user script, since no direct "open MIDI editor"
+tool call was available) -- confirmed by a real, distinct editor `hwnd` in
+the log and correct classification of the script's own internal actions
+(1227, "View: Zoom to project loop selection") as pass-through. But
+`dsl_run_action` with `section: 32060` (MIDI editor) for the actual
+scroll/zoom commands (40430-40433) never produced a `HOOK` line at all,
+before or after closing an unrelated stray dialog (see below). Command
+1000 (Main section, "View: Zoom vertically") showed the exact same
+symptom -- invoked twice, no `HOOK` line either time, while every other
+Main-section ID tried did reach the hook. Since this affects a native
+Main-section command untouched by the rebase (same `routing.h` entry,
+same registration code, unmodified since before this port existed), the
+most likely explanation is a gap in how the MCP tool dispatches those
+specific command IDs, not a plugin defect -- but it could not be
+conclusively resolved in this session, and it means the MIDI-editor half
+of the classification table was not directly exercised. The code path is
+identical to the Main-section path that WAS proven safe (same table, same
+`#ifdef` boundaries), so risk is assessed as low, not zero.
+
+**4. Mixer/MCP wheel scroll**: unreachable by construction, as designed --
+`DRIVE_MCP_WHEEL` is only ever set inside the Windows-only message hook
+(see the rebase section above), so there is no runtime path on Linux that
+reaches `ApplyMcpWheel` regardless of input. Confirmed by code inspection
+and the clean compile, not by a live trigger (there is nothing to
+trigger). No crash risk since the stub is never called.
+
+**5. Touchpad-style input**: see the direct-invocation checks above --
+`LastWheelDevice`'s stub ran on every `OnAction` call in this session
+(organic and direct), always returning the safe "no recent wheel"
+default. No dedicated touchpad hardware/synthetic-input path was
+available to test the reverse-zoom feature's actual UX, but the fallback
+it depends on is proven inert and crash-free.
+
+**6. Debug log, full session**: no warnings, no unexpected branches, no
+duplicate/storm HOOK activity, nothing resembling the native-Wayland flood
+in the section above. The only anomalies were the two tool-dispatch gaps
+noted in item 3, and one unrelated operator error (below).
+
+**Operator error, not a plugin issue**: action 40009 was guessed to be
+"open in built-in MIDI editor" and instead opened a Media Item Properties
+dialog, which then sat open. `xdotool`-driven synthetic clicks/keys
+(mousemove+click, explicit button down/up, `--window`-targeted click,
+Alt+F4) all reached the window (confirmed active/focused) but produced no
+effect -- REAPER's SWELL/XWayland input handling did not act on any of
+them. A real keypress (the user pressing Escape) closed it immediately.
+Worth knowing for future MCP-driven test sessions: this bridge can drive
+REAPER's own action list reliably, but cannot currently dismiss native
+modal dialogs -- avoid actions that open one, and if one appears, ask a
+human to close it rather than spending time on synthetic input.
+
+**Cleanup**: a disposable second project tab (`SmoothWheelTest`, one MIDI
+track/item, never saved to disk) was created for MIDI-editor testing and
+is still open, harmless, closable anytime. The user's original project
+tab was confirmed untouched throughout (checked track/item counts on both
+tabs; not dirty before the test, not modified by anything done here).
+
+**Not independently re-confirmed** (carried over as open items, same
+spirit as the original checklist's honesty about what "stock never showed
+the flood" does and doesn't establish): a deliberate by-hand pass of
+MIDI-editor wheel scroll/zoom, arrange vertical wheel-zoom specifically,
+and native mixer/TCP-panel fallback behavior, since real hardware wheel
+input (not just the one organic event captured) is the only way to fully
+close out those specific rows. Nothing observed in this session
+contradicts correctness on any of them.
 
 ## macOS
 
