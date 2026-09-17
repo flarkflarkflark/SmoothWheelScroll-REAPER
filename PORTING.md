@@ -1,7 +1,10 @@
 # Porting to Linux / macOS
 
-Status: Linux v1 builds and is under live testing. macOS not started (no
-Windows-hook-equivalent code exists yet on either platform -- see below).
+Status: Linux v1 (action-based glide, no settings UI) builds and is under
+live testing, rebased onto upstream 1.7.0. Settings window Phase 2a (empty,
+themed, open/closable panel) is live-tested on the `settings-ui-port` branch
+-- see below. macOS not started (no Windows-hook-equivalent code exists yet
+on either platform -- see below).
 
 ## Why this was tractable at all
 
@@ -17,8 +20,12 @@ surroundings removed.
    Replaced on Linux/macOS by REAPER's own `plugin_register("timer", ...)`,
    which already exists in this file (it used to only heal a dropped message
    hook) and needs no window or OS timer of its own.
-2. **The GDI settings window.** Not ported. Non-Windows builds always define
-   `SWS_NO_SETTINGS_UI`; the plugin runs on compiled-in defaults there.
+2. **The GDI settings window.** Partially ported (`settings-ui-port` branch,
+   Phase 2a): an empty, themed, open/closable panel exists via a SWELL dialog
+   resource -- see "Settings window: Phase 2a" below. The fader/knob controls
+   and the motion chart are not ported yet; `--no-settings-ui` still builds
+   the fully headless variant (now opt-out, matching `build.sh`'s own flag of
+   the same name, rather than the old hardcoded always-on exclusion).
 3. **The `WH_GETMESSAGE` wheel hook.** This is the one with no drop-in
    replacement, and it did more than "extra surfaces":
    - It drove two surfaces with no REAPER action at all (TCP panel body,
@@ -74,12 +81,15 @@ too ("merge or symlink in WDL" as a sibling of `sdk/`).
 ## Building
 
 ```sh
-./build-linux.sh              # release
-./build-linux.sh --debug-log  # writes $TMPDIR/SmoothWheelScroll.log (or /tmp)
+./build-linux.sh                    # release, settings window included
+./build-linux.sh --debug-log        # writes $TMPDIR/SmoothWheelScroll.log (or /tmp)
+./build-linux.sh --no-settings-ui   # headless, matching build.sh's own flag
 ```
 
-Produces `build/reaper_smoothwheelscroll-x86_64.so`. No settings-UI flag
-exists for this build (always headless) -- there is nothing to toggle yet.
+Produces `build/reaper_smoothwheelscroll-x86_64.so`. Building the settings
+window in requires Perl (`swell_resgen.pl`, vendored -- see VENDORED.md);
+`--no-settings-ui` skips that step entirely, same headless variant as before
+Phase 2a.
 
 ## Live-test checklist (Linux)
 
@@ -452,6 +462,95 @@ Native mixer/TCP-panel fallback behavior (item 8 of the original
 1.3.9-era smoke test below) was not re-touched here since nothing in the
 rebase changed that surface's already-documented "not ported, behaves
 natively" status.
+
+## Settings window: Phase 2a (branch `settings-ui-port`, 2026-09-17)
+
+Dialog architecture only -- no fader/knob controls, no motion chart. Goal was
+an empty, correctly-sized, correctly-themed panel opening and closing on
+Linux via both entry points, and that's what this phase delivers.
+
+**Why a dialog resource at all**: SWELL has no `CreateWindowEx`/`RegisterClass`
+-- confirmed against real WDL source, not assumed. The only way to get a
+window with child controls is a dialog resource, generated from a Win32 `.rc`
+file by `swell_resgen.pl` into a `.rc_mac_dlg` that's `#include`d and expands
+through macros in `swell-dlggen.h` (both vendored -- see VENDORED.md) into a
+real dialog template at compile time. This is the same mechanism REAPER
+itself and SWS use.
+
+**Decision: Windows untouched, Linux gets its own path.** Rather than move
+Windows onto the same dialog-resource mechanism (one code path, but touching
+a working, extensively-tuned feature purely for consistency), the existing
+`#ifdef _WIN32` half of the settings code -- everything from `CreatePanelChildren`
+through the accelerator table -- was left completely alone, now nested one
+level deeper inside a `#ifdef _WIN32`/`#else` split of its own. Verified with
+`unifdef -D_WIN32` the same way the earlier rebase was: preprocessed for
+Windows, `src/smooth_wheel_scroll.cpp` on `settings-ui-port` is byte-for-byte
+identical to `linux-port` -- zero Windows behavior change.
+
+**Decision: no scrolling.** The eventual full layout (`kDesignClientW/H` =
+360x527) comfortably fits any normal screen at 100% scale, and SWELL has no
+`GetScrollInfo`/`SetScrollInfo`/`ShowScrollBar` equivalent at all (checked
+against real WDL source). Building a fixed-size, non-scrolling panel avoids
+that gap entirely rather than working around it.
+
+**What's in the new `#else` branch**: a minimal `Theme` (background + text
+only -- the Windows version's 10-colour theme with card/line/grid brushes
+stays Windows-only until the fader/knob/chart phase needs it on Linux too),
+`ReadAppDarkFlag`/`ThemeColorRgb`/`ResolveTheme` (already-portable REAPER SDK
+calls, just the one `GetPrivateProfileIntA` -> `GetPrivateProfileInt` rename),
+`ApplyTitleBar`/`ApplyScrollbarTheme` as intentional no-ops (Linux window
+decorations are the desktop's own, outside the app's control -- same pattern
+as `StopTimer`/`StartTimer`'s Linux bodies elsewhere in this file), a minimal
+dialog proc (`WM_CTLCOLORDLG`/`WM_CTLCOLORSTATIC` for theming,
+`WM_CLOSE`/`WM_DESTROY` for lifecycle), `ShowConfigWindow`/`ToggleConfigWindow`,
+a pass-through `PanelKeyHandler` (no child controls yet to steal keys from),
+and a no-op `OnMenuHook` (the Extensions-menu entry itself works; the separate
+right-click-submenu convenience `OnMenuHook` adds elsewhere is deferred).
+
+**Bug found and fixed during testing, not just claimed to work**: the .rc's
+360x527 are old-style dialog units, and SWELL's non-macOS backend applies a
+fixed 1.9x dialog-unit-to-pixel factor with no compile-time override (the
+`SWELL_DEF_DLGSCALE2` macro in `swell-dlggen.h` is an unconditional `#define`
+outside `SWELL_TARGET_OSX`, and the alternate scale-aware macro path
+references `SWELL_DLG_WS_DEFAULT_SCALING`, which is itself only defined
+`#ifdef SWELL_TARGET_OSX` -- i.e. genuinely unusable on Linux, not a mistake
+on this project's part). On this machine that compounded with the desktop's
+own font/DPI scale into a panel measured at ~2.85x the requested size (1026x1501
+instead of 360x527). Fixed by measuring the border SWELL actually added
+(window rect minus client rect) immediately after `CreateDialogParam` and
+resizing to that plus the real target client size -- the same "measure, do
+not guess" approach `FitWindowToContent` already takes on Windows, aimed at
+the border instead of the content. Verified via screenshot: exact 360x527
+after the fix, both on first open and after 5 rapid open/close cycles.
+
+**Live-tested via MCP** (`flark-reaper-mcp`, real REAPER instance, not just
+compiled): built with `--debug-log`, installed, REAPER restarted clean, no
+crash on load. Both entry points wired and the action confirmed working --
+`_SWS_SCROLL_TUNE` resolved via named-command lookup and run directly (the
+Extensions-menu entry is the same unconditional, unmodified
+`AddExtensionsMainMenu()`/`custom_action` registration already covered by the
+scoping report as portable; not separately click-tested through the actual
+menu UI, since this session's earlier attempts at synthetic mouse/keyboard
+input into a REAPER-owned window were unreliable under this XWayland
+setup -- worth one manual check).
+
+Results: panel opens at the exact designed size, dark REAPER theme renders
+correctly (dark background, light text -- confirmed by screenshot; light
+theme not separately re-tested this session), closes cleanly via the same
+toggle action, and survived 5 rapid open/close cycles plus the underlying
+REAPER instance staying alive and responsive throughout. One unrelated
+`terminate called without an active exception` was observed in a *prior*
+REAPER session's stderr, immediately following a DrivenByMoss/JVM
+initialization sequence and with no SmoothWheelScroll log activity anywhere
+near it in time -- noted for completeness, not attributed to this plugin.
+
+**Not yet done** (later phases, tracked here rather than silently skipped):
+fader/knob custom controls (need SWELL's dialog child-control mechanism plus
+the `GWL_WNDPROC`-based subclassing pattern SWS itself uses, since SWELL has
+no `CreateWindowEx` for a custom control class either), `DrawMonitorBlock`
+(needs `TextOut` -> `DrawText`+RECT, `GetTextExtentPoint32A` -> `DT_CALCRECT`,
+`FrameRect` -> 4x`FillRect`, and `PS_DOT` -> manually-drawn dash segments,
+per the scoping report), docking support, and a real `OnMenuHook` port.
 
 ## macOS
 

@@ -2773,6 +2773,7 @@ static void InstallHook()
 // entry back for a tuning session.
 // ---------------------------------------------------------------------------
 #ifndef SWS_NO_SETTINGS_UI
+#ifdef _WIN32
 // --- Settings window -------------------------------------------------------
 //
 // Five sliders, one per feel group, plus the on/off switch. The chrome uses the STANDARD WINDOWS
@@ -5377,6 +5378,245 @@ static int PanelKeyHandler(MSG *msg, accelerator_register_t *ctx)
 }
 
 static accelerator_register_t g_accel = {PanelKeyHandler, true, nullptr};
+#else // !_WIN32
+// --- Settings window (Linux/macOS, Phase 2a) --------------------------------
+//
+// Phase 2a scope only (see PORTING.md's settings-ui-port scoping report and the Phase 2a
+// request): an empty, correctly-sized, correctly-themed panel that opens and closes cleanly.
+// No fader/knob controls and no motion chart yet -- those need SWELL's dialog-resource child
+// controls and a DrawMonitorBlock rewrite (TextOut/PS_DOT have no SWELL equivalent), both out
+// of scope here. `g_monWnd` (which arms the motion-chart's AnimSpawnBall/AnimRebuild, defined
+// above with the portable chart math) is deliberately left null until that phase, so the
+// wheel-glide path's behavior is unchanged from the already-verified linux-port branch.
+//
+// Windows has no dialog resource at all (see the #ifdef _WIN32 half above: its window and every
+// child control are built programmatically via CreateWindowEx/RegisterClass, untouched by this
+// branch). SWELL has neither of those -- the only way to get a window with child controls is a
+// dialog resource, generated from settings_panel_linux.rc by swell_resgen.pl at build time (see
+// build-linux.sh) into settings_panel_linux.rc_mac_dlg, included below.
+#include "settings_panel_linux_resource.h"
+
+// A minimal Theme for this phase: just what an empty, themed panel needs (background + text).
+// The Windows Theme struct (10 colours, brushes for cards/lines/grid) stays inside the #ifdef
+// _WIN32 half above -- extending this one is part of the fader/knob/chart phase, not this one.
+struct Theme
+{
+  COLORREF bg = 0, text = 0;
+  HBRUSH bgBrush = nullptr;
+  bool dark = false;
+};
+static Theme g_theme;
+
+// Portable: get_config_var and get_ini_file are REAPER SDK functions, not Win32 (see the
+// settings-ui-port scoping report). Only the GetPrivateProfileInt fallback (used when
+// get_config_var -- the path actually taken in practice -- is unavailable) needed the ANSI-suffix
+// rename SWELL uses (no trailing A, same as GetTextMetrics elsewhere in this file).
+static bool ReadAppDarkFlag(bool *outDark)
+{
+  if (get_config_var)
+  {
+    int sz = 0;
+    const void *p = get_config_var("win32_darkmode", &sz);
+    if (p && sz > 0)
+    {
+      const unsigned char *b = (const unsigned char *)p;
+      int v = 0;
+      if (sz >= (int)sizeof(int)) v = *(const int *)p;
+      else if (sz >= (int)sizeof(short)) v = (int)*(const short *)p;
+      else v = (int)b[0];
+      *outDark = (v != 0);
+      return true;
+    }
+  }
+  if (get_ini_file)
+  {
+    const char *ini = get_ini_file();
+    if (ini && *ini)
+    {
+      const int v = (int)GetPrivateProfileInt("reaper", "win32_darkmode", -1, ini);
+      if (v >= 0) { *outDark = (v != 0); return true; }
+    }
+  }
+  return false;
+}
+
+// One theme colour for `key`, decoded through ColorFromNative -- both REAPER SDK functions,
+// portable (see ThemeColorRgb's Windows-side twin above for why ColorFromNative matters: raw
+// masking reads the channels swapped).
+static bool ThemeColorRgb(const char *key, COLORREF *out)
+{
+  if (!GetThemeColor)
+    return false;
+  const int c = GetThemeColor(key, 0);
+  if (c < 0)
+    return false;
+  int r = -1, g = -1, b = -1;
+  if (ColorFromNative)
+    ColorFromNative(c, &r, &g, &b);
+  else
+  {
+    const COLORREF k = (COLORREF)(c & 0xFFFFFF);
+    r = (int)GetRValue(k); g = (int)GetGValue(k); b = (int)GetBValue(k);
+  }
+  *out = RGB(r, g, b);
+  return true;
+}
+
+static void ResolveTheme()
+{
+  bool dark = false;
+  ReadAppDarkFlag(&dark);
+  g_theme.dark = dark;
+  if (!ThemeColorRgb("col_main_bg2", &g_theme.bg))
+    g_theme.bg = dark ? RGB(30, 30, 30) : RGB(240, 240, 240);
+  if (!ThemeColorRgb("col_main_text", &g_theme.text))
+    g_theme.text = dark ? RGB(220, 220, 220) : RGB(0, 0, 0);
+  if (g_theme.bgBrush)
+    DeleteObject(g_theme.bgBrush);
+  g_theme.bgBrush = CreateSolidBrush(g_theme.bg);
+}
+
+// Windows-only OS chrome (DWM dark title bar / uxtheme scrollbar skin) -- see the Windows
+// ApplyTitleBar/ApplyScrollbarTheme above. Linux/macOS window decorations are drawn by the
+// desktop's own window manager, outside the app's control, so there is nothing to theme here.
+// Kept as named, callable no-ops (rather than omitted and guarded at every call site) because
+// that is the pattern this whole port already uses for a Windows-only mechanism with no
+// Linux/macOS equivalent -- see StopTimer/StartTimer's #else bodies.
+static void ApplyTitleBar(HWND, bool) {}
+static void ApplyScrollbarTheme(HWND, bool) {}
+
+static HWND g_cfgWnd = nullptr;
+
+static void RefreshPanelTheme()
+{
+  if (!g_cfgWnd || !IsWindow(g_cfgWnd))
+    return;
+  ResolveTheme();
+  InvalidateRect(g_cfgWnd, nullptr, TRUE);
+}
+
+// Not yet implemented: the Extensions/other-menu "SmoothScroll..." submenu entry the Windows
+// build adds via OnMenuHook. Registered below (unconditionally, from ReaperPluginEntry) because
+// the registration itself is cheap and platform-agnostic; the menu just never gains an entry on
+// Linux/macOS until this is ported alongside the fader/knob/chart work.
+static void OnMenuHook(const char *, void *, int) {}
+
+// Every matched action is left for REAPER to handle normally: there are no child controls yet
+// to steal Tab/Enter/Escape from (see the Windows PanelKeyHandler above for what this becomes
+// once there are).
+static int PanelKeyHandler(MSG *, accelerator_register_t *) { return 0; }
+static accelerator_register_t g_accel = {PanelKeyHandler, true, nullptr};
+
+static INT_PTR CfgProcLinux(HWND h, UINT msg, WPARAM wp, LPARAM lp)
+{
+  switch (msg)
+  {
+  case WM_INITDIALOG:
+    return 1;
+  case WM_CTLCOLORDLG:
+  case WM_CTLCOLORSTATIC:
+    SetTextColor((HDC)wp, g_theme.text);
+    SetBkMode((HDC)wp, TRANSPARENT);
+    return (INT_PTR)g_theme.bgBrush;
+  case WM_CLOSE:
+    DestroyWindow(h);
+    return 0;
+  case WM_DESTROY:
+    g_cfgWnd = nullptr;
+    return 0;
+  }
+  return 0;
+}
+
+static void ShowConfigWindow()
+{
+  if (g_cfgWnd && IsWindow(g_cfgWnd))
+  {
+    // Re-read the theme on every open, same reasoning as the Windows half above: REAPER's
+    // light/dark state may have changed since the window was built.
+    RefreshPanelTheme();
+    if (!IsWindowVisible(g_cfgWnd))
+      ShowWindow(g_cfgWnd, SW_SHOW);
+    SetForegroundWindow(g_cfgWnd);
+    return;
+  }
+  ResolveTheme();
+  g_cfgWnd = CreateDialogParam(g_hInst, MAKEINTRESOURCE(IDD_SWS_SETTINGS_LINUX), g_main,
+                               (DLGPROC)CfgProcLinux, 0);
+  if (!g_cfgWnd)
+    return;
+  // The dialog resource's 360x527 are old-style "dialog units", and SWELL's generic (non-macOS)
+  // backend applies its own fixed 1.9x dialog-unit-to-pixel factor to them with no compile-time
+  // override available (SWELL_DEF_DLGSCALE2 in swell-dlggen.h is a plain, unconditional #define
+  // outside SWELL_TARGET_OSX -- there is no hook to change it short of patching that header) --
+  // and on this machine that compounds with the desktop's own font/DPI scale into a window
+  // measured at ~2.85x the requested size. Rather than fight or guess at that (it depends on
+  // the user's own desktop scale, not just SWELL's constant), measure the border SWELL actually
+  // added (window minus client) and resize to that plus the real target client size -- the same
+  // "measure, do not guess" approach FitWindowToContent takes on Windows, just aimed at the
+  // border instead of the content.
+  {
+    const int kClientW = 360, kClientH = 527; // matches the Windows build's kDesignClientW/H
+    RECT wr0 = {0, 0, 0, 0}, cr0 = {0, 0, 0, 0};
+    GetClientRect(g_cfgWnd, &cr0); // void on SWELL (unlike Win32's BOOL), called separately
+    if (GetWindowRect(g_cfgWnd, &wr0))
+    {
+      const int borderW = (wr0.right - wr0.left) - (cr0.right - cr0.left);
+      const int borderH = (wr0.bottom - wr0.top) - (cr0.bottom - cr0.top);
+      SetWindowPos(g_cfgWnd, nullptr, 0, 0, kClientW + borderW, kClientH + borderH,
+                   SWP_NOMOVE | SWP_NOZORDER);
+    }
+  }
+  ApplyTitleBar(g_cfgWnd, g_theme.dark);       // no-op on this platform; see above
+  ApplyScrollbarTheme(g_cfgWnd, g_theme.dark); // no-op on this platform; see above
+  // Centred on REAPER's main window rather than the OS default (top-left) position -- the
+  // simple, single-window-relative version of what PlaceCenteredOnMain does on Windows, without
+  // that function's multi-monitor logic (MonitorFromRect has no SWELL equivalent -- see the
+  // scoping report -- and isn't needed for a fixed 360x527 panel next to REAPER's own window).
+  RECT mr = {0, 0, 0, 0}, pr = {0, 0, 0, 0};
+  if (g_main && GetWindowRect(g_main, &mr) && GetWindowRect(g_cfgWnd, &pr))
+  {
+    const int w = pr.right - pr.left, h = pr.bottom - pr.top;
+    int x = mr.left + ((mr.right - mr.left) - w) / 2;
+    int y = mr.top + ((mr.bottom - mr.top) - h) / 2;
+    SetWindowPos(g_cfgWnd, nullptr, x, y, 0, 0, SWP_NOSIZE | SWP_NOZORDER);
+  }
+  ShowWindow(g_cfgWnd, SW_SHOW);
+  SetForegroundWindow(g_cfgWnd);
+}
+
+static void ToggleConfigWindow()
+{
+  if (g_cfgWnd && IsWindow(g_cfgWnd) && IsWindowVisible(g_cfgWnd))
+    PostMessage(g_cfgWnd, WM_CLOSE, 0, 0);
+  else
+    ShowConfigWindow();
+}
+
+// swell-dlggen.h defines BEGIN/END/CONTROL/NOT/GROUP/etc as plain macros with no matching
+// #undef of their own (see VENDORED.md) -- scoped tightly here, right around the one generated
+// file that needs them, and undone immediately after so nothing later in this translation unit
+// (RemoveAll, OnTimer, ReaperPluginEntry, DllMain) can collide with so common a set of names.
+#include "swell-dlggen.h"
+#include "settings_panel_linux.rc_mac_dlg"
+#undef BEGIN
+#undef END
+#undef CONTROL
+#undef NOT
+#undef GROUP
+#undef PUSHBUTTON
+#undef DEFPUSHBUTTON
+#undef EDITTEXT
+#undef CTEXT
+#undef LTEXT
+#undef RTEXT
+#undef COMBOBOX
+#undef GROUPBOX
+#undef CHECKBOX
+#undef LISTBOX
+#undef ICON
+#undef IDC_STATIC
+#endif // _WIN32
 #endif // SWS_NO_SETTINGS_UI
 
 static void RemoveAll()

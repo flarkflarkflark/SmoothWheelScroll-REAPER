@@ -1,0 +1,25 @@
+// settings_panel_linux.rc -- Phase 2a: empty container only.
+//
+// SWELL has no CreateWindowEx/RegisterClass (see PORTING.md's settings-ui-port scoping report):
+// the only way to get a window with child controls on Linux/macOS is a dialog resource, the same
+// mechanism REAPER and SWS itself use. This file is parsed by swell_resgen.pl (vendored at
+// third_party/reaper-sdk-git/WDL/swell/swell_resgen.pl) at build time -- see build-linux.sh --
+// which turns it into settings_panel_linux.rc_mac_dlg, #included from smooth_wheel_scroll.cpp's
+// non-Windows branch. The Windows build never sees this file: its settings window stays exactly
+// as it was, built programmatically via CreateWindowEx/RegisterClass (see the #ifdef _WIN32 half
+// of the settings code).
+//
+// Deliberately just a container plus one placeholder for now (see the settings-ui-port Phase 2a
+// scope): the fader/knob controls and the motion chart are a later phase. Fixed size, no
+// WS_VSCROLL -- at 360x527 the eventual full layout comfortably fits any normal screen, so
+// scrolling was dropped from scope rather than built and left unused.
+#include "settings_panel_linux_resource.h"
+
+IDD_SWS_SETTINGS_LINUX DIALOG DISCARDABLE 0, 0, 360, 527
+STYLE DS_CENTER | WS_POPUP | WS_CAPTION | WS_SYSMENU
+CAPTION "Smooth Wheel Scroll"
+FONT 8, "MS Shell Dlg"
+BEGIN
+    LTEXT   "Smooth Wheel Scroll settings (Linux build -- controls not yet implemented)",
+            IDC_SWS_PLACEHOLDER, 8, 8, 344, 24
+END
