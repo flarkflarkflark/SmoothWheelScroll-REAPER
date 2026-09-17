@@ -301,6 +301,48 @@ afterward -- `stock/REAPER/UserPlugins`, `native/REAPER/UserPlugins`
 (untouched throughout), and the regular `~/.config/REAPER/UserPlugins`
 (untouched throughout).
 
+## Rebased onto upstream 1.7.0 (model/panel split)
+
+The fork's `main` was 12 commits behind `bobo198504/SmoothWheelScroll-REAPER`
+at the time of the v1 port and the smoke test above (both anchored to
+1.3.9). Rebasing onto 1.7.0 pulled in a source split (the single file's
+model now lives behind `src/model.h`, `src/device.h`, `src/routing.h`,
+`src/anim161_core.h`, `src/anim3_core.h`) and a settings-panel rework. None
+of the new headers touch Windows or REAPER -- pure math/data, same as
+`anim_core.h` before it -- so the split needed no platform guards of its
+own.
+
+Two more Windows-only surfaces existed in 1.7.0 that didn't exist at v1
+port time, and got the same treatment as the TCP panel body / MIDI piano
+keys above (scoped out, not ported):
+
+- **Mixer/MCP wheel forwarding** (`ApplyMcpWheel`): sends a synthetic
+  `WM_MOUSEWHEEL` to the mixer window, reached only through a `Route` the
+  message hook itself builds -- so unreachable on Linux/macOS regardless of
+  whether it's guarded. Stubbed to a no-op rather than left to fail to
+  compile on `WHEEL_DELTA`, which SWELL does not define.
+- **Touchpad device classification** (`LastWheelDevice` and its callers
+  `LastWheelWasTouchpad` / `LastWheelPassedThrough` / `TouchpadZoomReverse`):
+  depends on state (`g_lastDevTick`/`g_lastDevKind`) the message hook alone
+  sets. Stubbed to the same "no recent wheel" fallback the Windows code
+  already used for "no record", so every existing caller needed no change.
+
+`kFastTimerMs` was also retuned upstream (4ms -> 1ms) between 1.3.9 and
+1.7.0; that constant stays Windows-only (the multimedia timer it configures
+has no Linux/macOS equivalent -- see "The animation clock" above), so the
+retune carries through unchanged in spirit.
+
+Checked with `unifdef -D_WIN32` against `upstream/main`: preprocessed for
+Windows, `src/smooth_wheel_scroll.cpp` differs from upstream only in
+comments, one harmless declaration reorder, and `__declspec(dllexport)` ->
+the SDK's own `REAPER_PLUGIN_DLL_EXPORT` macro (identical expansion on
+Windows) -- no Windows behavior change. `build-linux.sh` builds clean.
+
+**Not yet re-run**: the live-test checklist and the stock-XWayland smoke
+test above were both against 1.3.9; they have not been repeated against
+1.7.0's reworked panel/model. Do that before calling the rebased port
+verified.
+
 ## macOS
 
 Not started. Once Linux is verified, the plan is: same source (the
