@@ -31,18 +31,34 @@
 // The motion itself (the animation) lives behind model.h and is pure math,
 // independent of REAPER; test/anim_sim.cpp exercises it standalone.
 
-#include <windows.h>
-#include <windowsx.h> // GET_X_LPARAM / GET_Y_LPARAM for the right-click menu
-#include <commctrl.h>
+// Plain C headers first, unconditionally, on every platform: SWELL's headers
+// (pulled in below on non-Windows) #define min/max as 2-arg macros, which
+// breaks any later-included libc/libstdc++ header that uses those names as
+// identifiers (std::numeric_limits<T>::max(), etc). Including these first
+// means they are fully parsed before that macro exists.
 #include <stdio.h>
 #include <stdlib.h>
 #include <stdarg.h>
 #include <math.h>
 #include <string.h>
 #include <ctype.h>
-#include <mmsystem.h>
 
+#ifdef _WIN32
+#include <windows.h>
+#include <windowsx.h> // GET_X_LPARAM / GET_Y_LPARAM for the right-click menu
+#include <commctrl.h>
+#include <mmsystem.h>
 #pragma comment(lib, "winmm")
+#else
+// Linux/macOS: the Windows-only mechanisms this file uses (the WH_GETMESSAGE
+// wheel hook, the GDI settings window, the winmm multimedia timer, and the
+// mixer/touchpad surfaces that only ever worked through that hook) are
+// compiled out below via #ifdef _WIN32 / SWS_NO_SETTINGS_UI -- see PORTING.md.
+// What remains needs only SWELL's Win32 type/function emulation plus a
+// couple of small shims; see platform_compat.h and
+// third_party/reaper-sdk-git/WDL/VENDORED.md.
+#include "platform_compat.h"
+#endif
 
 // ---------------------------------------------------------------------------
 // REAPER API surface (minimal set)
@@ -260,10 +276,12 @@ static const bool kFastTimer = false;
 // Animation tick for the plain thread timer, used only as the fallback when the multimedia timer is
 // unavailable. Windows runs this at about 15.6 ms here regardless of the requested value.
 static UINT kAnimTimerMs = 5;
+#ifdef _WIN32
 // Multimedia timer period. 1 ms is what the window maths assumes: at 50..400 ms that is 50..400
 // parts per amount. This is also the ceiling on how often the plugin can call REAPER, so it is the
 // number to raise first if a very fast roll ever costs too much (see AGENTS.md on call rate).
 static UINT kFastTimerMs = 1;
+#endif
 
 // Wheel messages count in WHEEL_DELTA units: one notch is 120. The model works in 7-bit units
 // (one notch is kNotchUnits = 15), so travel is converted into wheel deltas when it is handed to
@@ -390,7 +408,9 @@ static const int kRelIntMax = 63;       // max |integer part| in the relative fo
 // visible and is not confused with the model's travel.
 static const double kMixerUnitsPerNotch = kNotchUnits;
 
+#ifdef _WIN32
 static const DWORD kWheelFlagMs = 250;   // wheel->action latch validity window
+#endif
 
 // ---------------------------------------------------------------------------
 // Debug logging (compile-time gate)
@@ -410,6 +430,10 @@ static void DumpMouseModifiers(const char *why);
 // written in reaper-mouse.ini ("1 m" = the built-in Scroll TCP).
 //
 // The modifier flag is a bit field: +1 shift, +2 control, +4 alt, +8 win (from the SDK).
+//
+// Windows only: called only from the message hook (see PanelWheelAssignment's two call
+// sites, further down), which is itself Windows-only -- see PORTING.md.
+#ifdef _WIN32
 static void PanelWheelAssignment(const char *context, bool shift, bool ctrl, bool alt,
                                 char *out, int outSize)
 {
@@ -422,11 +446,13 @@ static void PanelWheelAssignment(const char *context, bool shift, bool ctrl, boo
   const int flag = (shift ? 1 : 0) | (ctrl ? 2 : 0) | (alt ? 4 : 0) | (win ? 8 : 0);
   GetMouseModifier(context, flag, out, outSize);
 }
+#endif
 
 static void Log(const char *fmt, ...)
 {
   if (!kDebugLog)
     return;
+#ifdef _WIN32
   char path[MAX_PATH];
   DWORD n = GetTempPathA(MAX_PATH, path);
   if (n == 0 || n + 32 >= MAX_PATH)
@@ -438,6 +464,22 @@ static void Log(const char *fmt, ...)
   SYSTEMTIME st;
   GetLocalTime(&st);
   fprintf(f, "%02d:%02d:%02d.%03d ", st.wHour, st.wMinute, st.wSecond, st.wMilliseconds);
+#else
+  const char *tmp = getenv("TMPDIR");
+  if (!tmp || !*tmp)
+    tmp = "/tmp";
+  char path[MAX_PATH];
+  snprintf(path, sizeof(path), "%s/SmoothWheelScroll.log", tmp);
+  FILE *f = fopen(path, "a");
+  if (!f)
+    return;
+  struct timespec ts;
+  clock_gettime(CLOCK_REALTIME, &ts);
+  struct tm tmv;
+  localtime_r(&ts.tv_sec, &tmv);
+  fprintf(f, "%02d:%02d:%02d.%03d ", tmv.tm_hour, tmv.tm_min, tmv.tm_sec,
+          (int)(ts.tv_nsec / 1000000));
+#endif
   va_list ap;
   va_start(ap, fmt);
   vfprintf(f, fmt, ap);
@@ -448,6 +490,7 @@ static void Log(const char *fmt, ...)
 
 static bool ArrangeScreenRect(RECT *out); // defined further down (surface section)
 
+#ifdef _WIN32
 static double Now()
 {
   static double freq = 0.0;
@@ -467,12 +510,24 @@ static double Now()
   }
   return (double)GetTickCount64() / 1000.0;
 }
+#else
+static double Now()
+{
+  struct timespec ts;
+  clock_gettime(CLOCK_MONOTONIC, &ts);
+  return (double)ts.tv_sec + (double)ts.tv_nsec / 1e9;
+}
+#endif
 
 // ---------------------------------------------------------------------------
 // Globals
 // ---------------------------------------------------------------------------
 static HINSTANCE g_hInst = nullptr;
 static HWND g_main = nullptr;
+static bool g_shuttingDown = false;
+static bool g_replaying = false;        // bypass flag for our own replay calls
+
+#ifdef _WIN32
 static UINT_PTR g_timer = 0;
 static bool g_timerOn = false;
 // The animation clock. SetTimer/CreateTimerQueueTimer are tied to the thread
@@ -489,7 +544,6 @@ static UINT g_mmTimerMs = kFastTimerMs; // period requested for the multimedia t
 static volatile LONG g_tickPosted = 0; // coalesce: one posted tick at a time
 static HHOOK g_msgHook = nullptr;
 static DWORD g_uiThreadId = 0;
-static bool g_shuttingDown = false;
 static volatile LONG g_wheelTick = 0;   // GetTickCount() of last arrange wheel; 0=none
 // WHAT the most recent wheel was: its Device verdict and the tick it arrived. Set for EVERY message
 // by the hook. Two things read it:
@@ -515,8 +569,8 @@ static bool g_sendingSynthWheel = false;
 static volatile LONG g_wheelSeq = 0;
 static DWORD g_wheelSeqTick = 0;
 static char g_wheelMods[4] = "---";     // last wheel's modifiers, for the action line
-static bool g_replaying = false;        // bypass flag for our own replay calls
 static bool g_timerPeriodRaised = false; // whether timeBeginPeriod(1) is active
+#endif // _WIN32
 
 // ---------------------------------------------------------------------------
 // Classification: which actions are view scroll / zoom, and how to drive them
@@ -1430,6 +1484,7 @@ static void Kick(Integrator &g, const Route &route, double wheelSign, double uni
   }
 }
 
+#ifdef _WIN32
 static void StopTimer()
 {
   if (g_mmTimer)
@@ -1445,6 +1500,13 @@ static void StopTimer()
   g_timerOn = false;
   InterlockedExchange(&g_tickPosted, 0);
 }
+#else
+// Linux/macOS: no OS timer resource of our own to start or stop -- REAPER's
+// own "timer" registration (see OnTimer, near the entry point) drives Tick()
+// directly and keeps running for the plugin's whole lifetime regardless of
+// whether a glide is active. See PORTING.md.
+static void StopTimer() {}
+#endif
 
 // Hand the mixer SMALL WHEEL MESSAGES, so REAPER's own mixer code moves it.
 //
@@ -1467,6 +1529,13 @@ static void StopTimer()
 // the UI thread, so this is a direct call, not a cross-thread one.
 //
 // deltaSigned is a whole device delta; positive = wheel up, matching a real WM_MOUSEWHEEL.
+//
+// Windows only: this hands the mixer a synthetic wheel message the same way the message hook
+// itself would, but it is only ever reached via a Route the hook builds (DRIVE_MCP_WHEEL is set
+// only inside the hook, further down) -- so on Linux/macOS this is unreachable dead code, same
+// as the TCP panel body and MIDI piano keys surfaces (see PORTING.md). Stubbed out below rather
+// than left to fail on WHEEL_DELTA, which SWELL does not define.
+#ifdef _WIN32
 static void ApplyMcpWheel(HWND mcp, int deltaSigned)
 {
   if (!mcp || deltaSigned == 0)
@@ -1492,6 +1561,9 @@ static void ApplyMcpWheel(HWND mcp, int deltaSigned)
     remain -= d;
   }
 }
+#else
+static void ApplyMcpWheel(HWND, int) {}
+#endif // _WIN32
 
 
 static void DeliverTravel(Integrator &g, double step)
@@ -1665,6 +1737,7 @@ static void Tick()
   }
 }
 
+#ifdef _WIN32
 // Fallback timer callback, used only if the multimedia timer is unavailable.
 static void CALLBACK AnimProc(HWND, UINT, UINT_PTR, DWORD)
 {
@@ -1742,6 +1815,12 @@ static void StartTimer()
   g_timer = SetTimer(nullptr, 0, kAnimTimerMs, AnimProc);
   g_timerOn = (g_timer != 0);
 }
+#else
+// Linux/macOS: nothing to start -- REAPER's own "timer" registration (see
+// OnTimer, near the entry point) already drives Tick() for the plugin's
+// whole lifetime. See PORTING.md.
+static void StartTimer() {}
+#endif // _WIN32
 
 // ---------------------------------------------------------------------------
 // hookcommand2 -- REAPER reports the action each wheel resolved to
@@ -1766,6 +1845,7 @@ static void StartTimer()
 // The Device verdict of the most recent wheel, or kUnknown-with-no-record when there is none. A
 // stale record (from an action with no wheel behind it) reports kNotched, so an unrelated action is
 // not mistaken for a passed-through wheel.
+#ifdef _WIN32
 static Device LastWheelDevice()
 {
   const DWORD t = (DWORD)InterlockedCompareExchange(&g_lastDevTick, 0, 0);
@@ -1773,6 +1853,12 @@ static Device LastWheelDevice()
     return Device::kNotched; // no recent wheel: treat as "not a pass-through"
   return (Device)InterlockedCompareExchange(&g_lastDevKind, 0, 0);
 }
+#else
+// Linux/macOS: no message hook yet to classify the device (see PORTING.md), so there is never a
+// recent-wheel record here -- always report the same "no record" verdict the Windows version
+// falls back to. LastWheelWasTouchpad/LastWheelPassedThrough and their callers need no changes.
+static Device LastWheelDevice() { return Device::kNotched; }
+#endif
 
 // Was the most recent wheel a TOUCHPAD? (For the direction-reverse feature, which is the one thing
 // a touchpad does get.)
@@ -1835,6 +1921,7 @@ static bool OnAction(KbdSectionInfo *sec, int command, int val, int val2, int re
 
   if (kDebugLog)
   {
+#ifdef _WIN32
     const DWORD lt = (DWORD)InterlockedCompareExchange(&g_wheelTick, 0, 0);
     // Which wheel does this action belong to? Only claim the pairing when the wheel was
     // recent, so an unrelated action (a script, a toolbar click) is not attributed to a
@@ -1845,6 +1932,12 @@ static bool OnAction(KbdSectionInfo *sec, int command, int val, int val2, int re
     Log("HOOK #%ld mod=%s sec=%d cmd=%d val=%d val2=%d relmode=%d hwnd=%p latch=%d", seq,
         g_wheelMods, sec ? sec->uniqueID : -999, command, val, val2, relmode, (void *)hwnd,
         lt ? 1 : 0);
+#else
+    // No message hook on this platform yet (see PORTING.md), so there is no wheel/sequence
+    // pairing or latch state to report.
+    Log("HOOK sec=%d cmd=%d val=%d val2=%d relmode=%d hwnd=%p",
+        sec ? sec->uniqueID : -999, command, val, val2, relmode, (void *)hwnd);
+#endif
   }
 
   if (!sec)
@@ -1855,7 +1948,9 @@ static bool OnAction(KbdSectionInfo *sec, int command, int val, int val2, int re
                        ClassifyByName(sec, command, spec);
   if (!matched)
   {
+#ifdef _WIN32
     InterlockedExchange(&g_wheelTick, 0);
+#endif
     if (kDebugLog && kbd_getTextFromCmd)
     {
       const char *nm = kbd_getTextFromCmd(command, sec);
@@ -1879,6 +1974,7 @@ static bool OnAction(KbdSectionInfo *sec, int command, int val, int val2, int re
   if (LastWheelPassedThrough())
     return false; // leave it to REAPER
 
+#ifdef _WIN32
   // Admission gate. The wheel latch exists to tell a wheel-driven action from a
   // keyboard-driven one. The "(MIDI CC relative/mousewheel)" actions are also
   // driven by a MIDI CC or OSC, which send no wheel message, so for those the
@@ -1896,6 +1992,13 @@ static bool OnAction(KbdSectionInfo *sec, int command, int val, int val2, int re
     }
   }
   InterlockedExchange(&g_wheelTick, 0);
+#else
+  // No wheel-latch source on this platform yet (see PORTING.md: the WH_GETMESSAGE hook this
+  // gate depends on is Windows-only). Every matched action is admitted regardless of what
+  // triggered it -- so a keyboard shortcut or script bound to one of these actions is
+  // glide-smoothed the same as a wheel notch would be. This is a deliberate, documented v1
+  // simplification, not an oversight; see PORTING.md.
+#endif
 
   // (A ball is launched from Kick, and from the glide-off branch below -- see those notes.)
 
@@ -1939,6 +2042,16 @@ static bool OnAction(KbdSectionInfo *sec, int command, int val, int val2, int re
   return true; // consume: REAPER must not perform its own jump
 }
 
+// ---------------------------------------------------------------------------
+// Everything from here through InstallHook() is Windows-only: the raw
+// WH_GETMESSAGE wheel hook, the surfaces it drives directly (TCP panel body,
+// MIDI piano keys, the mixer/MCP wheel forwarding), device classification for
+// the touchpad-reverse feature, and the wheel-vs-keyboard admission latch
+// OnAction reads (see the #else branch in OnAction's gate). See PORTING.md
+// for why this is out of scope for the Linux/macOS v1 port and what that
+// costs.
+// ---------------------------------------------------------------------------
+#ifdef _WIN32
 // ---------------------------------------------------------------------------
 // Message hook -- notice wheel activity and remember where it happened.
 //
@@ -2646,6 +2759,7 @@ static void InstallHook()
     Log("msg hook -> %p (thread %lu)", (void *)g_msgHook, g_uiThreadId);
   }
 }
+#endif // _WIN32
 
 // ---------------------------------------------------------------------------
 // TUNING UI -- the author's own debug tool, NOT shipped.
@@ -5278,6 +5392,7 @@ static void RemoveAll()
   // Stop seeing the keyboard queue before the rest of the plugin goes away.
   plugin_register("-accelerator", (void *)&g_accel);
 #endif
+#ifdef _WIN32
   if (g_msgHook)
   {
     UnhookWindowsHookEx(g_msgHook);
@@ -5293,16 +5408,21 @@ static void RemoveAll()
     timeEndPeriod(1);
     g_timerPeriodRaised = false;
   }
+#endif
 }
 
-// REAPER ticks this on the main thread; it heals a dropped message hook.
-//
-// It also WATCHES THE LIGHT/DARK FLAG. Relying on WM_THEMECHANGED alone left the panel half-switched:
-// measured, going light -> dark arrived (the whole panel followed) but dark -> light did not, so the
-// caption changed and the panel did not, until the window was reopened. REAPER does not promise to
-// announce this, and a half-switched panel is worse than a late one, so the flag is simply polled.
-// It is one GetPrivateProfileInt (or one get_config_var) against a value already in cache, so the
-// cost is nothing; only a CHANGE does any work.
+// REAPER ticks this on the main thread.
+//   Windows     : heals a dropped message hook (see InstallHook); the animation clock is
+//                 separate (StartTimer/StopTimer above). Also WATCHES THE LIGHT/DARK FLAG:
+//                 relying on WM_THEMECHANGED alone left the panel half-switched (measured,
+//                 going light -> dark arrived but dark -> light did not, until the window was
+//                 reopened), so the flag is simply polled here -- one GetPrivateProfileInt (or
+//                 one get_config_var) against a value already in cache, so the cost is nothing;
+//                 only a CHANGE does any work.
+//   Linux/macOS : IS the animation clock -- there is no message hook to heal and no settings
+//                 panel to theme-follow on this platform yet (see PORTING.md), so this drives
+//                 Tick() directly instead.
+#ifdef _WIN32
 static int g_healthCounter = 0;
 static void OnTimer()
 {
@@ -5324,6 +5444,14 @@ static void OnTimer()
   }
 #endif
 }
+#else
+static void OnTimer()
+{
+  if (g_shuttingDown)
+    return;
+  Tick();
+}
+#endif // _WIN32
 
 // ---------------------------------------------------------------------------
 // Entry point
@@ -5367,7 +5495,10 @@ static void DumpMouseModifiers(const char *why)
   }
 }
 
-extern "C" __declspec(dllexport) int ReaperPluginEntry(HINSTANCE hInst, reaper_plugin_info_t *rec)
+// REAPER_PLUGIN_DLL_EXPORT is the SDK's own per-platform export attribute
+// (reaper_plugin.h: __declspec(dllexport) on Windows, default-visibility
+// __attribute__ elsewhere) -- use it rather than inventing a second one.
+extern "C" REAPER_PLUGIN_DLL_EXPORT int ReaperPluginEntry(HINSTANCE hInst, reaper_plugin_info_t *rec)
 {
   if (!rec)
   {
@@ -5416,6 +5547,7 @@ extern "C" __declspec(dllexport) int ReaperPluginEntry(HINSTANCE hInst, reaper_p
   // runtime, and until then every wheel is forwarded untouched.
   LoadSettings();
 
+#ifdef _WIN32
   // Windows' default timer granularity is ~15.6 ms, coarser than g_releaseMs, so
   // the release would land as a single late step and wheel-to-wheel timing would
   // be lumpy. Ask for 1 ms resolution while the plugin is active.
@@ -5423,6 +5555,7 @@ extern "C" __declspec(dllexport) int ReaperPluginEntry(HINSTANCE hInst, reaper_p
     g_timerPeriodRaised = true;
 
   InstallHook();
+#endif
 
   if (!rec->Register("hookcommand2", (void *)OnAction))
     return 0;
@@ -5453,9 +5586,11 @@ extern "C" __declspec(dllexport) int ReaperPluginEntry(HINSTANCE hInst, reaper_p
 }
 
 // ---------------------------------------------------------------------------
+#ifdef _WIN32
 BOOL WINAPI DllMain(HINSTANCE hInst, DWORD reason, LPVOID)
 {
   if (reason == DLL_PROCESS_ATTACH)
     DisableThreadLibraryCalls(hInst);
   return TRUE;
 }
+#endif
