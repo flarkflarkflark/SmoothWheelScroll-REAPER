@@ -591,6 +591,83 @@ the panel. Temporary trace logging removed afterward; `unifdef -D_WIN32`
 re-confirmed the Windows path is still byte-for-byte identical to
 `linux-port`.
 
+## Settings window: Phase 2b (branch `settings-ui-port`, 2026-10-04, not committed)
+
+Phase 2a was an empty placeholder. Phase 2b makes the Linux/macOS panel functional and self-drawn.
+It has no child controls: the dialog only supplies the window, and `WM_PAINT` draws the chrome,
+the four parameter cards and the master switch (`PaintLinuxPanel`). Mouse input is hit-tested
+against the same rectangles the painting uses (`LinuxGeomOf`).
+
+**Controls and the globals they write** (same globals as the Windows panel, no second model):
+
+| Control | Global | Range / default |
+|---|---|---|
+| Enable smooth scrolling (click) | `g_glideOn` | on / off |
+| Reverse touchpad horizontal zoom | `g_touchpadReverse` | shown dimmed, not clickable |
+| Glide length | `g_windowMs` | 100-300 ms, 200 |
+| Slow step | `g_startDeltas` | 1-10 d, 5 |
+| Ramp-up | `g_budgetDeltas` | 60-2000 d, 1000 |
+| Top speed | `g_speedMul` | 1.0-2.0 x, 1.5 |
+
+Each change goes: set the global, `RefreshDerived()` (clamp), `SaveSettings()`. Painting reads the
+globals directly. Load is the existing `LoadSettings()` at plugin init.
+
+Gestures per parameter: click and drag on the track, mouse wheel (10 steps over the fader), double
+click to restore that one default.
+
+**Touchpad reverse is not offered on Linux.** `LastWheelDevice()` returns `kNotched` on non-Windows,
+so the touchpad rule never runs. The checkbox is drawn dimmed with "(n/a)" and does nothing.
+
+**Shared store fix.** `LoadSettings()` set `g_defaultsRev = 2` only inside the one-time migration.
+A store already on revision 2 kept `g_defaultsRev` at 0, so the next `SaveSettings()` wrote
+`defrev=0`, and the next start migrated again. A tuned Top speed of exactly 1.0 came back as 1.5.
+The assignment now sits after the migration, for both platforms. `check_settings_store.sh`
+reproduces this: it fails 5 checks on the old logic and passes on the fix.
+
+**Theme.** REAPER 7.81 exports `IsDarkMode()`. It is looked up once with `GetFunc("IsDarkMode")`,
+never through the SDK header. Older REAPER 7 builds do not have it, and `ReadAppDarkFlag` is the
+fallback. The mode is decided by the brightness of the panel background, not by that flag: on 7.81
+`IsDarkMode()` read 0 while a dark theme was active, which put dark text on the dark panel.
+Background: `COLOR_3DFACE` in a light theme (the REAPER dialog face, 179 here); `col_main_bg` in a dark
+theme, falling back to `col_main_bg2` where `col_main_bg` gives no value (measured on 7.81). Text:
+`col_main_text` only where it contrasts with the background, otherwise light text on dark and black
+on light (measured: a theme text of ~44 on a 51 panel). The palette (mode, background, text, line,
+sub) is hashed into a compact signature; the non-Windows timer compares it every 30th callback, and
+only a change repaints. `_diag/theme_watch_probe.cpp` covers these rules.
+
+**Measured on REAPER 7.81 (`IsDarkMode`, colours sampled from screenshots):** dark theme panel
+RGB(51,51,51), label text RGB(235,235,235), REAPER window RGB(69,69,69). Light theme panel RGB(179,179,179)
+against a REAPER window of about RGB(200,195,200): the panel is a shade darker than the arrange window,
+as the dialog face is darker than the arrange background. Accepted for now; visual decision.
+
+**Accent colours in the light theme: fixed in the current build, root cause not isolated.** An earlier
+build showed the faders as saturated blue, red and black in a light theme. After the background moved to
+the dialog face, the faders show the row hues again (sampled orange (255,190,0), green (180,220,0),
+magenta (200,0,255)). The earlier cause was not isolated, so the change is verified by sampling, not by
+an explanation.
+
+**Tests.** The gates `check_settings_ui.sh`, `check_settings_store.sh` and `check_theme_watch.sh`
+pass, and so do the 8 earlier gates. `--no-settings-ui` contains none of the panel, the theme watch,
+or the `IsDarkMode` lookup. Runtime in the isolated stock XWayland install: the panel opens,
+stays stable, and survives a close, a restart, and a second restart; 1.0 x persists. On REAPER
+7.81 (evaluation license, separate test root) the panel repaints without closing when the theme
+changes from dark to light. The light panel is RGB(128,128,128) on a REAPER window of about
+RGB(180,175,180); whether that colour is right for that theme is still a visual decision. On
+REAPER 7.78 the extension loads through the fallback and the settings toggle works (rechecked with the
+final artifact `3dc986af…`).
+
+**Not done in this phase:**
+- Docking and floating on Linux. There is no docker integration on the Linux path. It is
+  DEFERRED to its own slice, not PASS.
+- The response curve (motion chart). It needs dashed pens (PS_DOT), which SWELL does not provide.
+  Phase 2c.
+- Keyboard arrows on a fader. Mouse, wheel and double-click are implemented.
+- Windows-specific controls such as the context-menu dock toggle are not ported.
+
+**Visual differences from the Windows panel.** No chart, so the panel is 352 px high instead of
+527. The touchpad line carries "(n/a)" in its caption. The value text uses the same decimal rule as
+the Windows panel, so 1.85 shows as "1.8 x".
+
 ## Rebased onto upstream 1.7.1 / 1.7.2 (macros, mixer guard)
 
 Two upstream feature releases since the 1.7.0 rebase, pulled in together

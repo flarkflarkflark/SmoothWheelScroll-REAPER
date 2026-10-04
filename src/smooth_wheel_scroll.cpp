@@ -1091,8 +1091,10 @@ static void LoadSettings()
       if (fabs(g_startDeltas - kOldStart) < eps) g_startDeltas = kDefaultStart;
       if (fabs(g_budgetDeltas - kOldBudget) < eps) g_budgetDeltas = kDefaultBudget;
       if (fabs(g_speedMul - kOldSpeedMul) < eps) g_speedMul = kDefaultSpeedMul;
-      g_defaultsRev = 2;
     }
+    // Once the store has been read, it is on revision 2 whether or not this run migrated it. Set
+    // here, outside the migration, so a store already on 2 keeps its marker and SaveSettings writes it.
+    g_defaultsRev = 2;
   }
   if (GetExtState)
   {
@@ -5746,21 +5748,15 @@ static int PanelKeyHandler(MSG *msg, accelerator_register_t *ctx)
 
 static accelerator_register_t g_accel = {PanelKeyHandler, true, nullptr};
 #else // !_WIN32
-// --- Settings window (Linux/macOS, Phase 2a) --------------------------------
+// --- Settings window (Linux/macOS, Phase 2b) --------------------------------
 //
-// Phase 2a scope only (see PORTING.md's settings-ui-port scoping report and the Phase 2a
-// request): an empty, correctly-sized, correctly-themed panel that opens and closes cleanly.
-// No fader/knob controls and no motion chart yet -- those need SWELL's dialog-resource child
-// controls and a DrawMonitorBlock rewrite (TextOut/PS_DOT have no SWELL equivalent), both out
-// of scope here. `g_monWnd` (which arms the motion-chart's AnimSpawnBall/AnimRebuild, defined
-// above with the portable chart math) is deliberately left null until that phase, so the
-// wheel-glide path's behavior is unchanged from the already-verified linux-port branch.
-//
-// Windows has no dialog resource at all (see the #ifdef _WIN32 half above: its window and every
-// child control are built programmatically via CreateWindowEx/RegisterClass, untouched by this
-// branch). SWELL has neither of those -- the only way to get a window with child controls is a
-// dialog resource, generated from settings_panel_linux.rc by swell_resgen.pl at build time (see
-// build-linux.sh) into settings_panel_linux.rc_mac_dlg, included below.
+// Phase 2b: a functional, self-drawn panel that matches the Windows panel's look. It has NO child
+// controls: the dialog only supplies the window, and WM_PAINT draws the chrome, the four parameter
+// cards and the master switch (see PaintLinuxPanel). Mouse input is hit-tested against the same
+// rectangles the painting uses (see LinuxGeomOf). Every value is bound to the global the Windows
+// panel writes, so there is no second settings model. The motion chart is Phase 2c: it needs
+// TextOut-free drawing and dashed pens (PS_DOT), which SWELL does not provide. `g_monWnd` stays
+// null, and the wheel-glide path is unchanged.
 #include "settings_panel_linux_resource.h"
 
 // A minimal Theme for this phase: just what an empty, themed panel needs (background + text).
@@ -5769,6 +5765,9 @@ static accelerator_register_t g_accel = {PanelKeyHandler, true, nullptr};
 struct Theme
 {
   COLORREF bg = 0, text = 0;
+  COLORREF card = 0;  // a group sits on the panel colour, separated by its frame (as on Windows)
+  COLORREF line = 0;  // frame and rule colour
+  COLORREF sub = 0;   // captions and end labels
   HBRUSH bgBrush = nullptr;
   bool dark = false;
 };
@@ -5829,18 +5828,105 @@ static bool ThemeColorRgb(const char *key, COLORREF *out)
   return true;
 }
 
-static void ResolveTheme()
+// --- Theme (Linux/macOS panel) ----------------------------------------------
+// REAPER 7.81+ exports IsDarkMode(). It is looked up once through GetFunc (the SDK header here
+// predates it, so it is never declared through the header). Older REAPER 7 builds do not have it, and
+// the config-based ReadAppDarkFlag is the fallback.
+typedef bool (*IsDarkModeFn)();
+static IsDarkModeFn g_isDarkMode = nullptr;
+
+// The values the panel paints with, read from REAPER. A colour theme can change them without changing
+// the dark flag, so the dark flag alone is not enough to notice a theme change.
+struct Palette
 {
-  bool dark = false;
-  ReadAppDarkFlag(&dark);
-  g_theme.dark = dark;
-  if (!ThemeColorRgb("col_main_bg2", &g_theme.bg))
-    g_theme.bg = dark ? RGB(30, 30, 30) : RGB(240, 240, 240);
-  if (!ThemeColorRgb("col_main_text", &g_theme.text))
-    g_theme.text = dark ? RGB(220, 220, 220) : RGB(0, 0, 0);
+  bool dark;
+  COLORREF bg, text, line, sub; // the card is the background (see ApplyPalette)
+};
+
+static bool DetectDarkMode(bool *out)
+{
+  if (g_isDarkMode)
+  {
+    *out = g_isDarkMode();
+    return true;
+  }
+  return ReadAppDarkFlag(out);
+}
+
+// Perceived brightness of a colour, 0..255 (ITU-R 601 weights).
+static int LumaOf(COLORREF c)
+{
+  return (299 * GetRValue(c) + 587 * GetGValue(c) + 114 * GetBValue(c)) / 1000;
+}
+
+// The palette the panel paints with. The background is col_main_bg in a dark theme, and COLOR_3DFACE in a
+// light one (see below). The dark/light mode is taken
+// from that background's brightness, not from the dark flag: on 7.81 IsDarkMode() read 0 while the
+// dark theme was active (measured), and that put black text on the dark panel. The flag is only the
+// fallback for a REAPER that gives no background colour at all.
+static Palette ReadPalette()
+{
+  Palette p;
+  bool flag = false;
+  DetectDarkMode(&flag);
+  // col_main_bg is missing in some dark themes (measured on 7.81); col_main_bg2 is the next key.
+  COLORREF bg = 0;
+  const bool haveBg = ThemeColorRgb("col_main_bg", &bg) || ThemeColorRgb("col_main_bg2", &bg);
+  if (!haveBg)
+    bg = flag ? RGB(48, 48, 48) : RGB(240, 240, 240);
+  p.dark = haveBg ? (LumaOf(bg) < 128) : flag;
+  // Light: COLOR_3DFACE is the dialog face REAPER's own light dialogs use (179 here, the same as the
+  // REAPER window around the panel). It does not follow a dark theme, so dark keeps col_main_bg.
+  p.bg = (haveBg && !p.dark) ? (COLORREF)GetSysColor(COLOR_3DFACE) : bg;
+  // col_main_text is used only if it reads clearly against the background. In the dark theme on 7.81 it
+  // came back close to the panel colour (measured: text ~30-44 on 51), so a mode-based colour is used then.
+  p.text = p.dark ? RGB(235, 235, 235) : RGB(0, 0, 0);
+  COLORREF themeText = 0;
+  if (ThemeColorRgb("col_main_text", &themeText) && abs(LumaOf(themeText) - LumaOf(p.bg)) >= 100)
+    p.text = themeText;
+  p.line = p.dark ? RGB(32, 32, 32) : RGB(160, 160, 160);
+  ThemeColorRgb("col_main_3dsh", &p.line);
+  p.sub = RGB((GetRValue(p.bg) + GetRValue(p.text)) / 2,
+              (GetGValue(p.bg) + GetGValue(p.text)) / 2,
+              (GetBValue(p.bg) + GetBValue(p.text)) / 2);
+  return p;
+}
+
+// FNV-1a over the palette: one compact value per palette, so a change in any colour (or in the dark
+// flag) changes it. Compared every 30th timer callback; equal values mean nothing is repainted.
+static uint32_t ThemeSigOf(const Palette &p)
+{
+  const uint32_t vals[] = {p.dark ? 1u : 0u, (uint32_t)p.bg, (uint32_t)p.text, (uint32_t)p.line,
+                           (uint32_t)p.sub};
+  uint32_t h = 2166136261u;
+  for (uint32_t v : vals)
+    for (int b = 0; b < 4; ++b)
+    {
+      h ^= (v >> (8 * b)) & 0xFFu;
+      h *= 16777619u;
+    }
+  return h;
+}
+static uint32_t g_themeSig = 0; // the signature of the palette the panel is currently painted with
+
+// Puts a palette into the panel's theme state; the old brush is freed, the new one replaces it.
+static void ApplyPalette(const Palette &p)
+{
+  g_theme.dark = p.dark;
+  g_theme.bg = p.bg;
+  g_theme.card = p.bg;
+  g_theme.text = p.text;
+  g_theme.line = p.line;
+  g_theme.sub = p.sub;
   if (g_theme.bgBrush)
     DeleteObject(g_theme.bgBrush);
   g_theme.bgBrush = CreateSolidBrush(g_theme.bg);
+  g_themeSig = ThemeSigOf(p);
+}
+
+static void ResolveTheme()
+{
+  ApplyPalette(ReadPalette());
 }
 
 // Windows-only OS chrome (DWM dark title bar / uxtheme scrollbar skin) -- see the Windows
@@ -5917,11 +6003,274 @@ static void OnMenuHook(const char *menuidstr, void *menu, int /*flag*/)
   InsertMenuItem(hm, GetMenuItemCount(hm), TRUE, &mi);
 }
 
-// Every matched action is left for REAPER to handle normally: there are no child controls yet
-// to steal Tab/Enter/Escape from (see the Windows PanelKeyHandler above for what this becomes
-// once there are).
+// Every matched action is left for REAPER to handle normally: the Linux panel is self-drawn and takes
+// mouse input only, so it does not consume any key.
 static int PanelKeyHandler(MSG *, accelerator_register_t *) { return 0; }
 static accelerator_register_t g_accel = {PanelKeyHandler, true, nullptr};
+
+// The four feel rows. Name, range, default, end captions and hue are copied from the Windows
+// BuildSliderSpecs table (the Windows table also carries knob fields this panel does not have, so the
+// table itself is not shared). The STATE is the same globals the Windows panel writes.
+struct LinuxRow
+{
+  const char *name;
+  double *value;
+  double min, max, def;
+  const char *unit;
+  const char *lomark, *himark; // the two end captions
+  COLORREF hue;
+};
+static const int kLinuxRows = 4;
+static const LinuxRow kLinuxRowTable[kLinuxRows] = {
+    {"Glide length", &g_windowMs, kWindowMinMs, kWindowMaxMs, kDefaultWindowMs, "ms", "Snappy", "Gentle", RGB(120, 190, 255)},
+    {"Slow step", &g_startDeltas, kStartMin, kStartMax, kDefaultStart, "d", "Fine", "Coarse", RGB(255, 190, 120)},
+    {"Ramp-up", &g_budgetDeltas, kBudgetMin, kBudgetMax, kDefaultBudget, "d", "Quick", "Long", RGB(180, 220, 140)},
+    {"Top speed", &g_speedMul, kSpeedMulMin, kSpeedMulMax, kDefaultSpeedMul, "x", "Native", "Double", RGB(200, 170, 255)},
+};
+
+// The two switch captions. The touchpad one is shown dimmed and cannot be changed: on Linux the
+// wheel is always reported as notched (LastWheelDevice), so the touchpad direction rule never runs.
+static const char *kLinuxEnableText = "Enable smooth scrolling";
+static const char *kLinuxTouchpadText = "Reverse touchpad horizontal zoom (n/a)";
+
+// Trackbar-free painting: the geometry below is the Windows panel's own, at its 16 px text size and
+// without the motion chart. Every number is a client pixel at the panel's 360 px width.
+static const int kLxW = 360;
+static const int kLxPad = 16, kLxHeadH = 28, kLxRowH = 66, kLxCardPad = 9, kLxGroupH = 22,
+                 kLxBarH = 26, kLxCapW = 56, kLxBoxW = 16, kLxThumbW = 11;
+static const int kLinuxPanelH = kLxPad + kLxHeadH * 2 + kLxRowH * kLinuxRows + kLxPad; // 352
+
+// One row's rectangles, all in client coordinates. Painting and hit-testing both read this, so they
+// cannot disagree about where a control is.
+struct LinuxGeom
+{
+  RECT card, title, lo, fader, hi;
+};
+static LinuxGeom LinuxGeomOf(int i)
+{
+  LinuxGeom g;
+  const int top = kLxPad + kLxHeadH * 2 + kLxRowH * i;
+  g.card = {kLxPad, top, kLxW - kLxPad, top + kLxRowH};
+  const int ix = g.card.left + kLxCardPad;
+  const int iw = (g.card.right - kLxCardPad) - ix;
+  const int ty = g.card.top + kLxCardPad;
+  g.title = {ix, ty, ix + iw, ty + kLxGroupH - 2};
+  const int fy = ty + kLxGroupH;
+  g.lo = {ix, fy, ix + kLxCapW, fy + kLxBarH};
+  g.hi = {ix + iw - kLxCapW, fy, ix + iw, fy + kLxBarH};
+  g.fader = {ix + kLxCapW + 8, fy, ix + iw - kLxCapW - 8, fy + kLxBarH};
+  return g;
+}
+static RECT LinuxSwitchRect(int i)
+{
+  return {kLxPad, kLxPad + kLxHeadH * i, kLxW - kLxPad, kLxPad + kLxHeadH * (i + 1)};
+}
+
+// The same linear map as the Windows SliderToValue/ValueToSlider: positions 0..1000 span [min,max].
+static int LinuxPosOf(const LinuxRow &r, double v)
+{
+  if (r.max <= r.min)
+    return 0;
+  int p = (int)((v - r.min) / (r.max - r.min) * 1000.0 + 0.5);
+  if (p < 0) p = 0;
+  if (p > 1000) p = 1000;
+  return p;
+}
+static double LinuxValueOf(const LinuxRow &r, int pos)
+{
+  return r.min + (r.max - r.min) * (pos / 1000.0);
+}
+static double LinuxAmount(const LinuxRow &r)
+{
+  if (r.max <= r.min)
+    return 0.0;
+  double a = (*r.value - r.min) / (r.max - r.min);
+  if (a < 0.0) a = 0.0;
+  if (a > 1.0) a = 1.0;
+  return a;
+}
+
+// The Windows SliderColor rule: a blend from the card colour toward the row's hue, never fully washed out.
+static COLORREF LinuxSliderColor(int i, double amount)
+{
+  const double lo = 0.35, hi = 1.0;
+  if (amount < 0.0) amount = 0.0;
+  if (amount > 1.0) amount = 1.0;
+  const double a = lo + (hi - lo) * amount;
+  const COLORREF bg = g_theme.card;
+  const COLORREF c = kLinuxRowTable[i].hue;
+  return RGB((int)(GetRValue(bg) + (GetRValue(c) - GetRValue(bg)) * a + 0.5),
+             (int)(GetGValue(bg) + (GetGValue(c) - GetGValue(bg)) * a + 0.5),
+             (int)(GetBValue(bg) + (GetBValue(c) - GetBValue(bg)) * a + 0.5));
+}
+
+// The title text, formatted as the Windows UpdateLabels does: decimals follow the row's range.
+static void LinuxTitle(int i, char *buf, size_t n)
+{
+  const LinuxRow &r = kLinuxRowTable[i];
+  const double range = r.max - r.min;
+  const int dec = (range >= 10.0) ? 0 : (range >= 1.0) ? 1 : (range > 0.1) ? 2 : 3;
+  _snprintf(buf, n, "%s: %.*f %s", r.name, dec, *r.value, r.unit);
+}
+
+// A 1px outline drawn inside the rectangle (SWELL has no FrameRect), the same weight on all sides.
+static void LinuxFrame(HDC dc, const RECT &r, HBRUSH b)
+{
+  RECT top = {r.left, r.top, r.right, r.top + 1};
+  RECT bottom = {r.left, r.bottom - 1, r.right, r.bottom};
+  RECT left = {r.left, r.top, r.left + 1, r.bottom};
+  RECT right = {r.right - 1, r.top, r.right, r.bottom};
+  FillRect(dc, &top, b);
+  FillRect(dc, &bottom, b);
+  FillRect(dc, &left, b);
+  FillRect(dc, &right, b);
+}
+
+static void DrawLinuxCheck(HDC dc, const RECT &rc, const char *text, bool checked, bool enabled)
+{
+  SetBkMode(dc, TRANSPARENT);
+  const COLORREF ink = enabled ? g_theme.text : g_theme.sub;
+  const int top = rc.top + (rc.bottom - rc.top - kLxBoxW) / 2;
+  RECT box = {rc.left, top, rc.left + kLxBoxW, top + kLxBoxW};
+  HBRUSH edge = CreateSolidBrush(enabled ? g_theme.sub : g_theme.line);
+  LinuxFrame(dc, box, edge);
+  DeleteObject(edge);
+  if (checked)
+  {
+    HPEN pen = CreatePen(PS_SOLID, 2, ink);
+    HGDIOBJ oldPen = SelectObject(dc, pen);
+    const int x0 = box.left + 3, x1 = box.left + kLxBoxW / 2, x2 = box.right - 3;
+    const int y0 = box.top + kLxBoxW / 2;
+    MoveToEx(dc, x0, y0, nullptr);
+    LineTo(dc, x1, box.bottom - 4);
+    LineTo(dc, x2, box.top + 3);
+    SelectObject(dc, oldPen);
+    DeleteObject(pen);
+  }
+  RECT tr = {box.right + 6, rc.top, rc.right, rc.bottom};
+  SetTextColor(dc, ink);
+  DrawText(dc, text, -1, &tr, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
+}
+
+static void DrawLinuxRow(HDC dc, int i, HBRUSH lineBrush)
+{
+  const LinuxRow &r = kLinuxRowTable[i];
+  const LinuxGeom g = LinuxGeomOf(i);
+  SetBkMode(dc, TRANSPARENT);
+
+  char buf[160];
+  LinuxTitle(i, buf, sizeof(buf));
+  RECT t = g.title;
+  SetTextColor(dc, g_theme.text);
+  DrawText(dc, buf, -1, &t, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
+
+  RECT lo = g.lo, hi = g.hi;
+  SetTextColor(dc, g_theme.sub);
+  DrawText(dc, r.lomark, -1, &lo, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
+  DrawText(dc, r.himark, -1, &hi, DT_RIGHT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
+
+  // Groove in the row's own hue (its saturation carries the value), then the thumb at full strength.
+  const RECT f = g.fader;
+  const int cy = (f.top + f.bottom) / 2;
+  const int tl = f.left + kLxThumbW / 2;
+  const int tr = f.right - (kLxThumbW - kLxThumbW / 2);
+  const int span = tr - tl;
+  RECT groove = {tl, cy - 2, tr, cy + 2};
+  HBRUSH gb = CreateSolidBrush(LinuxSliderColor(i, LinuxAmount(r)));
+  FillRect(dc, &groove, gb);
+  DeleteObject(gb);
+
+  const int pos = LinuxPosOf(r, *r.value);
+  const int cx = tl + (span * pos + 500) / 1000;
+  RECT thumb = {cx - kLxThumbW / 2, f.top + 2, cx - kLxThumbW / 2 + kLxThumbW, f.bottom - 2};
+  HBRUSH tb = CreateSolidBrush(LinuxSliderColor(i, 1.0));
+  FillRect(dc, &thumb, tb);
+  DeleteObject(tb);
+  LinuxFrame(dc, thumb, lineBrush);
+
+}
+
+static void PaintLinuxPanel(HWND h)
+{
+  PAINTSTRUCT ps;
+  HDC dc = BeginPaint(h, &ps);
+  RECT rc;
+  GetClientRect(h, &rc);
+  FillRect(dc, &rc, g_theme.bgBrush);
+
+  // One outer frame around the block, a 1px rule between the cards and one under the switches,
+  // the same as the Windows panel's chrome.
+  HBRUSH cardBrush = CreateSolidBrush(g_theme.card);
+  HBRUSH lineBrush = CreateSolidBrush(g_theme.line);
+  for (int i = 0; i < kLinuxRows; ++i)
+  {
+    RECT card = LinuxGeomOf(i).card;
+    FillRect(dc, &card, cardBrush);
+  }
+  const RECT first = LinuxGeomOf(0).card, last = LinuxGeomOf(kLinuxRows - 1).card;
+  RECT group = {first.left, first.top, last.right, last.bottom};
+  LinuxFrame(dc, group, lineBrush);
+  for (int i = 1; i < kLinuxRows; ++i)
+  {
+    RECT sep = LinuxGeomOf(i).card;
+    sep.bottom = sep.top + 1;
+    FillRect(dc, &sep, lineBrush);
+  }
+  RECT rule = {kLxPad, kLxPad + kLxHeadH * 2 + 2, kLxW - kLxPad, kLxPad + kLxHeadH * 2 + 3};
+  FillRect(dc, &rule, lineBrush);
+
+  DrawLinuxCheck(dc, LinuxSwitchRect(0), kLinuxEnableText, g_glideOn, true);
+  DrawLinuxCheck(dc, LinuxSwitchRect(1), kLinuxTouchpadText, g_touchpadReverse, false);
+  for (int i = 0; i < kLinuxRows; ++i)
+    DrawLinuxRow(dc, i, lineBrush);
+
+  DeleteObject(cardBrush);
+  DeleteObject(lineBrush);
+  EndPaint(h, &ps);
+}
+
+// Which fader, if any, is under a client point. -1 = none.
+static int LinuxFaderAt(int x, int y)
+{
+  for (int i = 0; i < kLinuxRows; ++i)
+  {
+    const RECT f = LinuxGeomOf(i).fader;
+    if (x >= f.left && x < f.right && y >= f.top && y < f.bottom)
+      return i;
+  }
+  return -1;
+}
+
+static bool LinuxInRect(const RECT &r, int x, int y)
+{
+  return x >= r.left && x < r.right && y >= r.top && y < r.bottom;
+}
+
+// Write one row's value from a 0..1000 position: the same order as the Windows fader handlers
+// (set the global, clamp it, persist it). Painting reads the global, so no state is kept here.
+static int g_linuxDrag = -1; // the fader being dragged, or -1
+static void SetLinuxPos(int i, int pos)
+{
+  const LinuxRow &r = kLinuxRowTable[i];
+  *r.value = LinuxValueOf(r, pos);
+  RefreshDerived();
+  SaveSettings();
+}
+
+// Click x -> 0..1000 across the fader's track, clamped at both ends (as the Windows FaderPosFromX).
+static int LinuxPosFromX(int i, int x)
+{
+  const RECT f = LinuxGeomOf(i).fader;
+  const int tl = f.left + kLxThumbW / 2;
+  const int tr = f.right - (kLxThumbW - kLxThumbW / 2);
+  const int span = tr - tl;
+  if (span <= 0)
+    return 0;
+  int p = (int)(((long long)(x - tl) * 1000 + span / 2) / span);
+  if (p < 0) p = 0;
+  if (p > 1000) p = 1000;
+  return p;
+}
 
 static INT_PTR CfgProcLinux(HWND h, UINT msg, WPARAM wp, LPARAM lp)
 {
@@ -5929,16 +6278,79 @@ static INT_PTR CfgProcLinux(HWND h, UINT msg, WPARAM wp, LPARAM lp)
   {
   case WM_INITDIALOG:
     return 1;
+  case WM_ERASEBKGND:
+    return 1; // painted in WM_PAINT, so the dialog does not flicker
+  case WM_PAINT:
+    PaintLinuxPanel(h);
+    return 0;
   case WM_CTLCOLORDLG:
-  case WM_CTLCOLORSTATIC:
-    SetTextColor((HDC)wp, g_theme.text);
-    SetBkMode((HDC)wp, TRANSPARENT);
     return (INT_PTR)g_theme.bgBrush;
+  case WM_LBUTTONDOWN:
+  {
+    const int x = (short)LOWORD(lp), y = (short)HIWORD(lp);
+    if (LinuxInRect(LinuxSwitchRect(0), x, y))
+    {
+      g_glideOn = !g_glideOn;
+      SaveSettings();
+      InvalidateRect(h, nullptr, FALSE);
+      return 0;
+    }
+    const int i = LinuxFaderAt(x, y);
+    if (i >= 0)
+    {
+      SetCapture(h);
+      g_linuxDrag = i;
+      SetLinuxPos(i, LinuxPosFromX(i, x));
+      InvalidateRect(h, nullptr, FALSE);
+    }
+    return 0;
+  }
+  case WM_LBUTTONDBLCLK:
+  {
+    // Double click restores that ONE parameter to its default (the Windows gesture).
+    const int i = LinuxFaderAt((short)LOWORD(lp), (short)HIWORD(lp));
+    if (i >= 0)
+    {
+      SetLinuxPos(i, LinuxPosOf(kLinuxRowTable[i], kLinuxRowTable[i].def));
+      InvalidateRect(h, nullptr, FALSE);
+    }
+    return 0;
+  }
+  case WM_MOUSEMOVE:
+    if (g_linuxDrag >= 0 && GetCapture() == h)
+    {
+      SetLinuxPos(g_linuxDrag, LinuxPosFromX(g_linuxDrag, (short)LOWORD(lp)));
+      InvalidateRect(h, nullptr, FALSE);
+    }
+    return 0;
+  case WM_LBUTTONUP:
+    if (g_linuxDrag >= 0)
+    {
+      ReleaseCapture();
+      g_linuxDrag = -1;
+    }
+    return 0;
+  case WM_MOUSEWHEEL:
+  {
+    // The wheel arrives in screen coordinates; a fader under the pointer steps by 10, as on Windows.
+    POINT p = {(short)LOWORD(lp), (short)HIWORD(lp)};
+    ScreenToClient(h, &p);
+    const int i = LinuxFaderAt(p.x, p.y);
+    if (i >= 0)
+    {
+      const int delta = (short)HIWORD(wp);
+      const int pos = LinuxPosOf(kLinuxRowTable[i], *kLinuxRowTable[i].value);
+      SetLinuxPos(i, pos + (delta > 0 ? 10 : -10));
+      InvalidateRect(h, nullptr, FALSE);
+    }
+    return 0;
+  }
   case WM_CLOSE:
     DestroyWindow(h);
     return 0;
   case WM_DESTROY:
     g_cfgWnd = nullptr;
+    g_linuxDrag = -1;
     return 0;
   }
   return 0;
@@ -5972,7 +6384,7 @@ static void ShowConfigWindow()
   // "measure, do not guess" approach FitWindowToContent takes on Windows, just aimed at the
   // border instead of the content.
   {
-    const int kClientW = 360, kClientH = 527; // matches the Windows build's kDesignClientW/H
+    const int kClientW = kLxW, kClientH = kLinuxPanelH; // no motion chart on Linux, so no chart height
     RECT wr0 = {0, 0, 0, 0}, cr0 = {0, 0, 0, 0};
     GetClientRect(g_cfgWnd, &cr0); // void on SWELL (unlike Win32's BOOL), called separately
     if (GetWindowRect(g_cfgWnd, &wr0))
@@ -6101,11 +6513,37 @@ static void OnTimer()
 #endif
 }
 #else
+#ifndef SWS_NO_SETTINGS_UI
+// Compares the palette with the one the panel shows, and repaints only if it changed.
+static int g_themeTick = 0;
+static bool ThemeWatchStep(uint32_t *lastSig, uint32_t sig)
+{
+  if (sig == *lastSig)
+    return false;
+  *lastSig = sig;
+  return true;
+}
+static void WatchTheme()
+{
+  if (!g_cfgWnd || !IsWindow(g_cfgWnd))
+    return;
+  if (ThemeWatchStep(&g_themeSig, ThemeSigOf(ReadPalette())))
+    RefreshPanelTheme();
+}
+#endif
+
 static void OnTimer()
 {
   if (g_shuttingDown)
     return;
   Tick();
+#ifndef SWS_NO_SETTINGS_UI
+  if (++g_themeTick >= 30)
+  {
+    g_themeTick = 0;
+    WatchTheme();
+  }
+#endif
 }
 #endif // _WIN32
 
@@ -6261,6 +6699,10 @@ extern "C" REAPER_PLUGIN_DLL_EXPORT int ReaperPluginEntry(HINSTANCE hInst, reape
     return 0;
   if (!rec->Register("timer", (void *)OnTimer))
     return 0;
+#if !defined(_WIN32) && !defined(SWS_NO_SETTINGS_UI)
+  // Optional REAPER 7.81+ API. Null on older REAPER; DetectDarkMode falls back to the config flag.
+  g_isDarkMode = (IsDarkModeFn)rec->GetFunc("IsDarkMode");
+#endif
 
   // Expose the settings window as a real main-section action (so it shows in the
   // Actions list and can be bound to a shortcut) plus an Extensions-menu entry.
