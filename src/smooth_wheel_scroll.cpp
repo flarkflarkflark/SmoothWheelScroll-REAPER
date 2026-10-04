@@ -93,6 +93,17 @@
 // wheel). This is how the panel rules avoid hijacking a gesture the user has rebound:
 // see TcpWheelIsPlainScroll.
 #define REAPERAPI_WANT_GetMouseModifier
+// Reading a "Custom:" action's children. The SDK does not expose a macro's contents (its docs point
+// at reaper-kb.ini instead), so the command id is turned into its id STRING and that is used as the
+// key into the file. Both lookups are official; neither writes anything.
+#define REAPERAPI_WANT_ReverseNamedCommandLookup
+#define REAPERAPI_WANT_NamedCommandLookup
+// Diagnosing which actions exist and what REAPER calls them. A macro's child ids are not the ids in
+// this plugin's table, so the only way to know what a child IS is to ask REAPER for its name -- and
+// the only way to know whether an action has a wheel-relative sibling is to enumerate. Read-only.
+#ifdef SWS_DEBUG_LOG
+#define REAPERAPI_WANT_kbd_enumerateActions
+#endif
 // The mixer needs NO API. Its only official interface, SetMixerScroll, takes a TRACK -- so it
 // cannot express anything finer than a whole track, and using it produced exactly that
 // visible stepping. The animated travel is instead handed to REAPER's own mixer window as a
@@ -291,6 +302,12 @@ static const double kNotchUnits = 15.0;
 static const double kDeltasPerNotch = 120.0;
 static const double kDeltasPerUnit = kDeltasPerNotch / kNotchUnits;
 
+// How many actions a "Custom:" macro may contain and still be driven (see the macro section below).
+// Beyond this the macro is simply left to REAPER: the cap is the fixed size of the per-child carry
+// arrays, and a macro deeper than a handful of actions is not the case this feature exists for.
+// Kept in step with MacroDef::kMaxChildren by a static assert where the two meet.
+static const int kMacroMax = 8;
+
 // THE MAIN VIEW'S VERTICAL ZOOM uses the 1.6.1 CURVE MODEL, not the window model (AGENTS.md 111).
 // Its parameters are the 1.6.1 defaults, copied here so the zoom's feel is exactly the accepted one:
 // measured, the window model's travel sliders made a sustained zoom move 5-8x too little.
@@ -382,14 +399,18 @@ static const double kSyncReleaseMs = 5.0;
 static const double kRelSubPerUnit = 256.0; // fractional sub-steps per 7-bit unit
 // How a whole-unit receiver's travel is delivered: in whole 7-bit units.
 //
-// This number has been moved twice, in both directions, and the measurements say where it
-// belongs. It must be 1.0 (whole units):
+// This number has been moved in both directions, and it belongs at 1.0 (whole units):
 //   - At the finest grid (1/3840 of a notch) the axis JITTERED -- the receiver cannot act on a
 //     step that small, so consecutive values cancelled against each other.
-//   - At 1/8 unit the axis came back LURCHING, and the log shows why: the receiver was sent
-//     1.125 and 1.25 unit pieces, i.e. it rounded each one UP to its own step, so a stream of
-//     slightly-different sub-unit values arrived as a stream of oversized jumps. It wants whole
-//     units and reads anything between them as the next unit up.
+//   - At 1/8 unit the axis came back LURCHING, with pieces of 1.125 and 1.25 units in the log.
+//     What used to be written here -- "so it rounded each one UP to its own step" -- was an
+//     INFERENCE from a log of what this plugin SENT, never a measurement of what REAPER DID;
+//     AGENTS.md section 68 retracted exactly that class of evidence. The lurching is real; the
+//     cause was never established.
+//   - 2026-09-20, measured again with everything else held identical (build/-VERTPROBE.dll, 1
+//     delta instead of a whole unit): the user found it LESS comfortable than whole units --
+//     vertical zoom no more linear, nothing gained. So 1.0 stays, and this time the comparison
+//     is on record (AGENTS.md section 111, supplement two).
 //   - At whole units the pieces are exactly what it acts on, so nothing is lost or rounded.
 //
 // A gentle notch's travel (measured, about 0.6 units at Start 5%) is then smaller than one
@@ -414,6 +435,10 @@ static const DWORD kWheelFlagMs = 250;   // wheel->action latch validity window
 
 // ---------------------------------------------------------------------------
 // Debug logging (compile-time gate)
+//
+// Kept SEPARATE from the DEV wheel log on purpose. The wheel log's own build must not drag in the
+// per-wheel verbose logging (it is heavy and would fill %TEMP% for no reason); the two switches are
+// independent and can be combined if someone wants both.
 // ---------------------------------------------------------------------------
 #ifdef SWS_DEBUG_LOG
 static const bool kDebugLog = true;
@@ -423,6 +448,7 @@ static const bool kDebugLog = false;
 
 // Diagnostics, defined with the entry point; declared here so the wheel hook can call it.
 static void DumpMouseModifiers(const char *why);
+static void DumpActionNames(const char *why);
 
 // What is assigned to a panel's wheel Mouse Modifier context for this exact modifier
 // combination? The context is one of the MM_CTX_* names ("Track control panel / Mouse
@@ -584,6 +610,9 @@ static bool g_timerPeriodRaised = false; // whether timeBeginPeriod(1) is active
 #include "routing.h"
 // Which DEVICE sent a wheel (notched / free-spinning / touchpad). Pure arithmetic, no REAPER.
 #include "device.h"
+// Parsing a "Custom:" action's definition out of reaper-kb.ini. Pure text, no REAPER.
+#include "macro.h"
+static_assert(kMacroMax == MacroDef::kMaxChildren, "macro child cap must match the parser's");
 
 #ifndef SWS_NO_SETTINGS_UI
 // ---------------------------------------------------------------------------
@@ -1100,21 +1129,218 @@ static void LoadSettings()
 //  natural gesture and no longer has a control, so the code is gone rather than left
 //  unreachable.)
 
-// Name-based classification: the thin REAPER-facing shell around routing.h.
+// WHICH COMMANDS WILL BE TAKEN OVER -- the ONE place that answers it.
 //
-// The rule itself (which names are admitted, and the axis/kind they resolve to) lives in
-// ClassifyName() in src/routing.h -- pure string logic with no REAPER dependency, so it can be
-// compiled and diffed outside REAPER. This function only fetches the name from REAPER and hands it
-// over, which is the one part that cannot leave this file.
-static bool ClassifyByName(KbdSectionInfo *sec, int command, ActionSpec &out)
+// The table first (actions known by id), then the name rule (everything else, matched on the
+// action's own name). Both live in src/routing.h as pure logic; this is only the REAPER-facing
+// shell that fetches the name.
+//
+// IT IS CALLED FOR EVERY CHILD OF A MACRO TOO (see MacroChildren), and that is the point: the
+// exclusions the name rule carries -- "one page" scrolls above all, which jump a whole page per call
+// and ignore the value handed in -- apply to a macro's children for free, with no second list to
+// keep in step. A macro is driven only when EVERY child passes here.
+static bool ClassifyCommand(KbdSectionInfo *sec, int command, ActionSpec &out)
 {
-  if (!sec || !kbd_getTextFromCmd)
+  if (!sec)
     return false;
-  const char *nm = kbd_getTextFromCmd(command, sec);
-  if (!ClassifyName(sec->uniqueID, nm, out))
+  if (LookupAction(sec->uniqueID, command, out))
+  {
+    out.command = command;
+    return true;
+  }
+  if (!kbd_getTextFromCmd)
+    return false;
+  if (!ClassifyName(sec->uniqueID, kbd_getTextFromCmd(command, sec), out))
     return false;
   out.command = command; // the name rule does not carry the id; the caller has it
   return true;
+}
+
+// ---------------------------------------------------------------------------
+// CUSTOM ACTIONS ("macros")
+//
+// A "Custom:" action is a LIST of actions REAPER runs in one go. Handed one unchanged, REAPER runs
+// the whole list once per notch -- so a macro of scroll actions scrolls, but in discrete jumps, which
+// is the report this feature answers ("有用户把多个次滚动命令组合在一起，没有实现丝滑的滚动").
+//
+// WHAT THE PLUGIN DOES INSTEAD: it drives the list itself from ONE glide. Measured on this machine
+// (Win+wheel on a two-action macro): REAPER dispatches the macro as ONE command (its own id), and
+// hands it the SAME relative value a plain wheel gets -- relmode=1, val=113 for one notch, identical
+// to the bare wheel. So no extra wheel state is needed: the relative amount is already in hand, and
+// the children are simply fed the same travel through the ordinary replay path.
+//
+// WHERE THE LIST COMES FROM: not the SDK -- its documentation says custom action ID strings are
+// found in reaper-kb.ini, so that file is READ (the same kind of read the plugin already makes to
+// reaper.ini for the dark flag; nothing in REAPER's install is ever written -- AGENTS.md 5). The
+// command id gives the id STRING via ReverseNamedCommandLookup, which is the key into that file;
+// src/macro.h does the parsing.
+//
+// ALL OR NOTHING: the macro is taken over only when EVERY child passes ClassifyCommand. One child the
+// plugin does not recognise -- a "one page" scroll, a script, another macro, anything that is not a
+// scroll/zoom it drives -- and the whole macro is left to REAPER. That rule is not caution for its
+// own sake: a macro runs each action ONCE, while the plugin replays an action many times to spread
+// the travel out. If a macro contained "select next item", animating it would select dozens of them.
+// ---------------------------------------------------------------------------
+static const char *kCustomPrefix = "Custom:"; // REAPER's own naming for these
+
+// Resolve one child token to a command id. A digit-leading token is already an id; a "_NAME" token is
+// looked up (with and without the underscore, because the SDK does not say which form it wants, and
+// guessing wrong would silently refuse every named child).
+static int MacroResolveChild(const char *tok)
+{
+  if (!tok || !*tok)
+    return 0;
+  if ((tok[0] >= '0' && tok[0] <= '9') || tok[0] == '-')
+    return atoi(tok);
+  if (tok[0] != '_')
+    return 0; // not a form we know
+  if (!NamedCommandLookup)
+    return 0;
+  int id = NamedCommandLookup(tok);
+  if (id <= 0)
+    id = NamedCommandLookup(tok + 1);
+  return id;
+}
+
+// Find the macro's children. Returns the count when the command is a "Custom:" action that could be
+// read, else 0 (and the caller then leaves it alone -- the safe direction for every failure: no name,
+// no id string, no file, no matching line, too many children).
+static int MacroChildren(KbdSectionInfo *sec, int command, ActionSpec *out, int maxOut,
+                         char *why, int whySize)
+{
+  if (why && whySize > 0)
+    why[0] = 0;
+  if (!sec || !kbd_getTextFromCmd || !ReverseNamedCommandLookup || !get_ini_file)
+    return 0;
+
+  const char *nm = kbd_getTextFromCmd(command, sec);
+  if (!nm || strncmp(nm, kCustomPrefix, strlen(kCustomPrefix)) != 0)
+    return 0; // not a custom action at all
+
+  const char *guid = ReverseNamedCommandLookup(command);
+  if (!guid || !*guid)
+    return 0; // no id string: nothing to look up
+
+  // reaper-kb.ini sits beside reaper.ini, whose path REAPER hands us.
+  const char *ini = get_ini_file();
+  if (!ini || !*ini)
+    return 0;
+  char path[MAX_PATH];
+  _snprintf(path, sizeof(path), "%s", ini);
+  char *slash = strrchr(path, '\\');
+  if (!slash)
+    slash = strrchr(path, '/');
+  if (!slash)
+    return 0;
+  *(slash + 1) = 0;
+  if (strlen(path) + 16 >= MAX_PATH)
+    return 0;
+  strcat(path, "reaper-kb.ini");
+
+  // Read the whole file: a macro definition can be anywhere in it, and the file is small. Re-read per
+  // macro wheel event rather than cached -- a cache would go stale the moment the user edits a macro,
+  // and this only runs when a wheel actually lands on a "Custom:" action.
+  FILE *f = fopen(path, "rb");
+  if (!f)
+  {
+    if (why && whySize > 0)
+      _snprintf(why, whySize, "cannot open %s", path);
+    return 0;
+  }
+  fseek(f, 0, SEEK_END);
+  const long len = ftell(f);
+  if (len <= 0 || len > 4 * 1024 * 1024)
+  {
+    fclose(f);
+    return 0;
+  }
+  fseek(f, 0, SEEK_SET);
+  char *text = (char *)malloc((size_t)len + 1);
+  if (!text)
+  {
+    fclose(f);
+    return 0;
+  }
+  const size_t got = fread(text, 1, (size_t)len, f);
+  fclose(f);
+  text[got] = 0;
+
+  MacroDef def;
+  const bool ok = MacroParse(text, guid, def);
+  free(text);
+  if (!ok || !def.found)
+  {
+    if (why && whySize > 0)
+      _snprintf(why, whySize, "no ACT line for %s", guid);
+    return 0;
+  }
+  if (def.overflow || def.nChildren <= 0)
+  {
+    if (why && whySize > 0)
+      _snprintf(why, whySize, "%d children (max %d)", def.nChildren, MacroDef::kMaxChildren);
+    return 0;
+  }
+
+  // The children live in the macro's OWN section, so that is the section to classify them in. The
+  // KbdSectionInfo we were handed describes the section the macro was dispatched in, which is the
+  // same one, so its name lookup is the right one to use.
+  if (def.section != sec->uniqueID)
+  {
+    if (why && whySize > 0)
+      _snprintf(why, whySize, "section %d != %d", def.section, sec->uniqueID);
+    return 0;
+  }
+
+  const int n = def.nChildren < maxOut ? def.nChildren : maxOut;
+  for (int i = 0; i < n; ++i)
+  {
+    const int cid = MacroResolveChild(def.child[i]);
+    if (cid <= 0)
+    {
+      if (why && whySize > 0)
+        _snprintf(why, whySize, "child %d \"%s\" does not resolve", i + 1, def.child[i]);
+      return 0;
+    }
+    ActionSpec cs;
+    const bool classified = ClassifyCommand(sec, cid, cs);
+    // The child's own NAME is the deciding evidence for whether a macro can be driven, and it cannot
+    // be guessed from the id (the ids in a macro are not the ones this plugin's table lists). So it
+    // is logged: the log is where the answer to "why was my macro refused" comes from.
+    if (kDebugLog && kbd_getTextFromCmd)
+      Log("macro child %d/%d: tok=\"%s\" id=%d name=\"%s\" classified=%d", i + 1, n, def.child[i],
+          cid, kbd_getTextFromCmd(cid, sec) ? kbd_getTextFromCmd(cid, sec) : "?", classified ? 1 : 0);
+    if (!classified)
+    {
+      if (why && whySize > 0)
+        _snprintf(why, whySize, "child %d (%d) is not one we drive", i + 1, cid);
+      return 0;
+    }
+    // Every child must be a plain replay target whose delivery can be spread over time: a child that
+    // takes the WHOLE notch at once (Delivery::kImmediate) cannot be animated at all, so a macro
+    // containing one is refused rather than half-driven.
+    //
+    // THE CHILDREN MAY SIT ON DIFFERENT AXES, and that is deliberate (the common "zoom both ways" macro
+    // is exactly that shape). The axis only decides which GLIDE runs the gesture -- one wheel event is
+    // one travel, shared by every child -- while each child carries its own section and command and is
+    // replayed through them, and its own delivery grid is resolved per child in DeliverOne. So a
+    // horizontal and a vertical child are no harder than two horizontal ones. (An earlier version
+    // refused a mixed axis: it was written on the assumption that a gesture could only feed one axis,
+    // which was a limit of that draft, not of the design.)
+    if (cs.drive != DRIVE_REPLAY)
+    {
+      if (why && whySize > 0)
+        _snprintf(why, whySize, "child %d (%d) is not replay-driven", i + 1, cid);
+      return 0;
+    }
+    if (FilterFor(cs) != Delivery::kStream && FilterFor(cs) != Delivery::kStepUnits)
+    {
+      if (why && whySize > 0)
+        _snprintf(why, whySize, "child %d (%d) takes a whole notch at once", i + 1, cid);
+      return 0;
+    }
+    out[i] = cs;
+  }
+  return n;
 }
 
 // ---------------------------------------------------------------------------
@@ -1156,7 +1382,25 @@ struct Integrator
   // stays null (= zero), so the struct keeps its place in .bss. AGENTS.md's .bss rule.
   model161::Axis *glide161 = nullptr;
   bool zoom161 = false; // this gesture runs on the 1.6.1 curve model (vertical zoom)
+
+  // A "Custom:" action has SEVERAL receivers, and each must carry its own fractional remainder:
+  // sharing one accumulator would let one child's rounding cancel another's. `nMacro` is 0 for an
+  // ordinary single-action gesture, which is every case that does not involve a macro.
+  //
+  // The child specs are reached through a POINTER into a file-scope global, for the same reason as
+  // glide161 above: ActionSpec has non-zero member initialisers, so an array of them held BY VALUE
+  // would move this whole struct (with the model's two 2048-entry arrays) out of .bss. The pointer
+  // stays null (= zero), so the struct keeps its place.
+  int nMacro = 0;                    // number of children being driven (0 = not a macro)
+  ActionSpec *macroChild = nullptr;  // the children, in the macro's own order
+  double macroAccum[kMacroMax] = {0}; // one carry per child (all-zero, so still .bss)
 };
+
+// The macro child specs, one set per axis, kept as globals so Integrator stays zero-initialisable
+// (see the note on macroChild). Only one axis runs a macro at a time in practice; the second set
+// exists so the lookup is uniform.
+static ActionSpec g_macroVert[kMacroMax];
+static ActionSpec g_macroHorz[kMacroMax];
 
 // The 1.6.1 motion state, one per axis, kept as file-scope globals so `Integrator` stays zero-
 // initialisable (see the note on glide161). Only the vertical axis ever uses one (the zoom actions
@@ -1177,6 +1421,14 @@ static void AxisReset(Integrator &g)
 
 static Integrator g_vert;
 static Integrator g_horz;
+
+// Bind each axis's macro child specs (see the note on Integrator::macroChild). Called once at load,
+// and it is all this needs: the pointer never changes, only the contents.
+static void BindMacroChildArrays()
+{
+  g_vert.macroChild = g_macroVert;
+  g_horz.macroChild = g_macroHorz;
+}
 
 // ---------------------------------------------------------------------------
 // One notch's travel, in each drive's own unit. The animation treats that unit
@@ -1350,6 +1602,18 @@ static void ApplyTravelNow(Integrator &g, double signedTravel)
   {
     // Reached only when Release is at or below kSyncReleaseMs (an immediate step,
     // no animation). The value is still sent at full 14-bit resolution.
+    //
+    // A macro owes EVERY child this travel, exactly as the animated path does -- without this the
+    // synchronous case would move only the first action of the macro.
+    if (g.nMacro > 0)
+    {
+      for (int i = 0; i < g.nMacro; ++i)
+      {
+        ReplayAction(g.macroChild[i].section, g.macroChild[i].command, g.replayHwnd, signedTravel);
+        g.macroAccum[i] = 0.0;
+      }
+      return;
+    }
     ReplayAction(g.section, g.command, g.replayHwnd, signedTravel);
     return;
   }
@@ -1363,6 +1627,11 @@ struct Route
 {
   ActionSpec spec;              // section / command / axis / kind / drive
   HWND hwnd = nullptr;          // context window to replay the action on
+  // A "Custom:" action that was recognised as drivable (see MacroChildren): its children are in
+  // child[] and the gesture fans the travel out to all of them. nMacro is 0 for an ordinary action,
+  // which is every case that is not a macro.
+  int nMacro = 0;
+  ActionSpec child[kMacroMax];
 };
 
 // units: the amount the wheel reported, in 7-bit units (fractional ok). MODEL 3.0 does no shaping
@@ -1403,6 +1672,21 @@ static void Kick(Integrator &g, const Route &route, double wheelSign, double uni
   g.lastSection = section;
   g.lastCommand = command;
 
+  // A recognised macro: copy its children onto this axis and clear their carries. Copied rather than
+  // pointed at, so the spec array cannot be overwritten under a gesture by the next wheel.
+  g.nMacro = (route.nMacro > 0 && g.macroChild) ? route.nMacro : 0;
+  for (int i = 0; i < g.nMacro; ++i)
+  {
+    g.macroChild[i] = route.child[i];
+    if (!sameOp)
+      g.macroAccum[i] = 0.0;
+  }
+  if (g.nMacro == 0)
+  {
+    for (int i = 0; i < kMacroMax; ++i)
+      g.macroAccum[i] = 0.0;
+  }
+
   const double sign = wheelSign;
   const double unit = OneNotchUnit();
   const double recvDeltas = fabs(units) * kDeltasPerNotch; // this message, in wheel deltas
@@ -1433,8 +1717,25 @@ static void Kick(Integrator &g, const Route &route, double wheelSign, double uni
   // gesture, not a per-notch amount: each notch STACKS a claim and the speed climbs toward a ceiling
   // over the rise time. That is why the whole message goes in as ONE notch of travel (`unit*units`,
   // as 1.6.1 fed it) instead of being pre-scaled -- the build-up is the model's job, not ours.
-  const bool zoom161 = FullTravelFor(route.spec);
+  //
+  // A MACRO NEVER TAKES THIS PATH (route.nMacro): the 1.6.1 model drives ONE receiver, so a macro's
+  // children would silently get nothing. A macro's spec carries its first child's axis/kind purely so
+  // the axis choice is right -- without this guard a macro starting with a vertical zoom would match
+  // FullTravelFor and be swallowed here.
+  const bool zoom161 = (route.nMacro == 0) && FullTravelFor(route.spec);
   g.zoom161 = zoom161;
+
+  if (g.nMacro > 0)
+  {
+    // The macro's own delivery, derived from its children through the same FilterFor the children
+    // themselves go through: it is only used by the "gesture never reached a whole unit" top-up, so
+    // it takes the step-unit form only when EVERY child needs it.
+    bool allStep = true;
+    for (int i = 0; i < g.nMacro; ++i)
+      if (FilterFor(g.macroChild[i]) != Delivery::kStepUnits)
+        allStep = false;
+    g.delivery = allStep ? Delivery::kStepUnits : Delivery::kStream;
+  }
 
   if (zoom161)
   {
@@ -1566,10 +1867,87 @@ static void ApplyMcpWheel(HWND, int) {}
 #endif // _WIN32
 
 
+// Deliver ONE child's share, using that child's own carry. Split out of DeliverTravel so a macro's
+// children each keep their own remainder -- sharing one accumulator would let one child's rounding
+// cancel another's. `step` is this frame's travel for THIS receiver.
+static void DeliverOne(Integrator &g, double step, const ActionSpec &spec, double &accum,
+                       bool &sent)
+{
+  if (step == 0.0)
+    return;
+
+  const Delivery delivery = FilterFor(spec);
+  accum += step;
+
+  if (delivery == Delivery::kStepUnits)
+  {
+    // A receiver that moves in whole increments still gets its travel in PIECES -- it just gets
+    // pieces no finer than that receiver can act on (see the long note this replaces).
+    const double grid = 1.0 / kVertStepsPerUnit;
+    const double m = floor(fabs(accum) / grid + 0.5);
+    if (m >= 1.0)
+    {
+      const double send = m * grid;
+      const double signed_send = (accum < 0.0) ? -send : send;
+      accum -= signed_send;
+      sent = true;
+      ReplayAction(spec.section, spec.command, g.replayHwnd, signed_send);
+    }
+    return;
+  }
+
+  if (kFineValues)
+  {
+    const double grid = 1.0 / kRelSubPerUnit;
+    const double m = floor(fabs(accum) / grid + 0.5);
+    if (m >= 1.0)
+    {
+      const double send = m * grid;
+      const double signed_send = (accum < 0.0) ? -send : send;
+      accum -= signed_send;
+      sent = true;
+      ReplayAction(spec.section, spec.command, g.replayHwnd, signed_send);
+    }
+  }
+  else
+  {
+    // Baseline: whole relative units only, rounded to nearest (never truncated), with the
+    // fraction carried. This is exactly the pre-precision behaviour.
+    const double m = floor(fabs(accum) + 0.5);
+    if (m >= 1.0)
+    {
+      const int whole = (int)m;
+      const double signed_send = (accum < 0.0) ? -(double)whole : (double)whole;
+      accum -= signed_send;
+      sent = true;
+      ReplayAction(spec.section, spec.command, g.replayHwnd, signed_send);
+    }
+  }
+}
+
 static void DeliverTravel(Integrator &g, double step)
 {
   if (step == 0.0)
     return;
+
+  // A macro: the SAME travel goes to every child, which is exactly what REAPER's own macro run does
+  // (each action gets the notch) -- except that here it is spread over time instead of happening
+  // once. Only children that pass ClassifyCommand are ever here (see MacroChildren), so every one of
+  // them can be driven this way.
+  if (g.nMacro > 0)
+  {
+    for (int i = 0; i < g.nMacro; ++i)
+    {
+      bool sent = false;
+      DeliverOne(g, step, g.macroChild[i], g.macroAccum[i], sent);
+      g.sentThisBurst = g.sentThisBurst || sent;
+    }
+    return;
+  }
+
+  bool sent = false;
+  DeliverOne(g, step, ActionSpec{g.section, g.command}, g.accum, sent);
+  (void)sent;
 
   if (g.drive == DRIVE_MCP_WHEEL)
   {
@@ -1593,66 +1971,8 @@ static void DeliverTravel(Integrator &g, double step)
         Log("MCP send delta=%d (%.3f notch); accum left %.4f units", sendDelta,
             sendDelta / kDeltasPerNotch, g.accum);
     }
-    return;
   }
-
-
-  if (g.drive == DRIVE_REPLAY)
-  {
-    g.accum += step;
-    if (g.delivery == Delivery::kStepUnits)
-    {
-      // A receiver that moves in whole increments still gets its travel in PIECES -- it just
-      // gets pieces no finer than that receiver can act on.
-      //
-      // Whole-unit-only was wrong. A gentle notch travels well UNDER one 7-bit unit (measured:
-      // 0.6 units at Start 5%), so flooring to whole units collapsed a smooth gesture into a
-      // single 1-unit step -- larger than the travel itself. That is the "sudden speed-up
-      // while creeping" that was reported. The grid is now kVertStepsPerUnit pieces per unit:
-      // fine enough that a slow gesture is still a stream of small pieces, coarse enough to
-      // stay clearly above the finest step that used to make this axis jitter.
-      const double grid = 1.0 / kVertStepsPerUnit;
-      const double m = floor(fabs(g.accum) / grid + 0.5);
-      if (m >= 1.0)
-      {
-        const double send = m * grid;
-        const double signed_send = (g.accum < 0.0) ? -send : send;
-        g.accum -= signed_send;
-        g.sentThisBurst = true;
-        ReplayAction(g.section, g.command, g.replayHwnd, signed_send);
-      }
-      return;
-    }
-    if (kFineValues)
-    {
-      // Device-stream output: the relative form's finest step is 1/kRelSubPerUnit
-      // of a 7-bit unit, so accumulate on that grid and carry the remainder -- a
-      // step too small to send this frame is added to the next one.
-      const double grid = 1.0 / kRelSubPerUnit;
-      const double m = floor(fabs(g.accum) / grid + 0.5);
-      if (m >= 1.0)
-      {
-        const double send = m * grid;
-        const double signed_send = (g.accum < 0.0) ? -send : send;
-        g.accum -= signed_send;
-        ReplayAction(g.section, g.command, g.replayHwnd, signed_send);
-      }
-    }
-    else
-    {
-      // Baseline: whole relative units only, rounded to nearest (never truncated),
-      // with the fraction carried. This is exactly the pre-precision behaviour.
-      const double m = floor(fabs(g.accum) + 0.5);
-      if (m >= 1.0)
-      {
-        const int whole = (int)m;
-        const double signed_send = (g.accum < 0.0) ? -(double)whole : (double)whole;
-        g.accum -= signed_send;
-        ReplayAction(g.section, g.command, g.replayHwnd, signed_send);
-      }
-    }
-    return;
-  }
+  // DRIVE_REPLAY was handled by DeliverOne above, including the macro fan-out. Nothing is left here.
 }
 
 // ---------------------------------------------------------------------------
@@ -1725,7 +2045,23 @@ static void Tick()
     {
       const double send = (g.accum < 0.0) ? -1.0 : 1.0;
       g.accum = 0.0;
-      ReplayAction(g.section, g.command, g.replayHwnd, send);
+      // A macro's children carry their own remainders, so the top-up goes to each of them too --
+      // otherwise a gesture that never reached a whole unit would move only the first child.
+      if (g.nMacro > 0)
+      {
+        for (int i = 0; i < g.nMacro; ++i)
+        {
+          if (g.macroAccum[i] == 0.0)
+            continue;
+          const double s = (g.macroAccum[i] < 0.0) ? -1.0 : 1.0;
+          g.macroAccum[i] = 0.0;
+          ReplayAction(g.macroChild[i].section, g.macroChild[i].command, g.replayHwnd, s);
+        }
+      }
+      else
+      {
+        ReplayAction(g.section, g.command, g.replayHwnd, send);
+      }
       if (kDebugLog)
         Log("top-up sec=%d cmd=%d -> one unit (gesture never reached a whole unit)",
             g.section, g.command);
@@ -1944,9 +2280,23 @@ static bool OnAction(KbdSectionInfo *sec, int command, int val, int val2, int re
     return false;
 
   ActionSpec spec;
-  const bool matched = LookupAction(sec->uniqueID, command, spec) ||
-                       ClassifyByName(sec, command, spec);
+  int macroN = 0;
+  ActionSpec macroChild[kMacroMax];
+  const bool matched = ClassifyCommand(sec, command, spec);
   if (!matched)
+  {
+    // Not an action we drive -- but it may be a "Custom:" MACRO of actions we DO drive, which REAPER
+    // would otherwise run as a burst. MacroChildren resolves it and refuses everything it cannot fully
+    // account for (a script, a nested macro, a "one page" scroll, a mixed axis).
+    macroN = MacroChildren(sec, command, macroChild, kMacroMax, nullptr, 0);
+    if (macroN > 0)
+    {
+      spec = macroChild[0]; // the axis/kind/drive that the gesture runs on
+      spec.command = command;
+      spec.section = sec->uniqueID;
+    }
+  }
+  if (!matched && macroN <= 0)
   {
 #ifdef _WIN32
     InterlockedExchange(&g_wheelTick, 0);
@@ -2034,11 +2384,15 @@ static bool OnAction(KbdSectionInfo *sec, int command, int val, int val2, int re
   Route route;
   route.spec = spec;
   route.hwnd = hwnd;
+  // A recognised macro hands its children over with the route; Kick copies them onto the axis.
+  route.nMacro = macroN;
+  for (int i = 0; i < macroN; ++i)
+    route.child[i] = macroChild[i];
   Kick(g, route, wheelSign, notches);
   StartTimer();
   if (kDebugLog)
-    Log("smooth sec=%d cmd=%d val=%d drive=%d hwnd=%p", sec->uniqueID, command, val,
-        (int)spec.drive, (void *)hwnd);
+    Log("smooth sec=%d cmd=%d val=%d drive=%d hwnd=%p macro=%d", sec->uniqueID, command, val,
+        (int)spec.drive, (void *)hwnd, macroN);
   return true; // consume: REAPER must not perform its own jump
 }
 
@@ -2426,6 +2780,7 @@ static bool IsAnimatableWheel(int delta)
   return kind == Device::kNotched || kind == Device::kFreeSpin;
 }
 
+
 static LRESULT CALLBACK GetMsgProc(int code, WPARAM wParam, LPARAM lParam)
 {
   // Our own mixer wheel is sent with SendMessage, which goes straight to the window procedure
@@ -2450,7 +2805,10 @@ static LRESULT CALLBACK GetMsgProc(int code, WPARAM wParam, LPARAM lParam)
 
       // WHICH DEVICE: the two wheels go through the model (3.0), a touchpad is left to REAPER.
       // The latch is cleared for a pass-through so the action path stays out of it too.
-      if (!IsAnimatableWheel(delta))
+      const bool animatable = IsAnimatableWheel(delta);
+
+
+      if (!animatable)
       {
         InterlockedExchange(&g_wheelTick, 0);
         return CallNextHookEx(g_msgHook, code, wParam, lParam);
@@ -2609,7 +2967,22 @@ static LRESULT CALLBACK GetMsgProc(int code, WPARAM wParam, LPARAM lParam)
             break;
           }
         }
-        if (mcp)
+        // A wheel over an MCP KNOB or FADER (or any other value control) is a PARAMETER wheel,
+        // and parameter wheels are never touched -- that is the project's first rule, the same
+        // one the panels already obey through SurfaceWindow. Without this guard the mixer was
+        // taken UNCONDITIONALLY (see below), and a fader steps once per wheel MESSAGE while the
+        // glide sends a stream of whole deltas, so one notch became several steps -- reported as
+        // +12 dB where the native wheel gives +3. Same failure as "one page" and MIDI vertical
+        // zoom, and the answer is the same: leave the wheel alone, do not retune the step size.
+        // The hit-test string is REAPER's own; ThingIsValueControl already lists the mcp.* names,
+        // so the mixer BODY and its empty area still scroll.
+        char mthing[128] = {0};
+        if (mcp && GetThingFromPoint)
+          GetThingFromPoint(m->pt.x, m->pt.y, mthing, (int)sizeof(mthing));
+        const bool mcpValue = ThingIsValueControl(mthing);
+        if (mcpValue && kDebugLog)
+          Log("SKIP #%ld mcp wheel: value control \"%s\" -- left to REAPER", wheelSeq, mthing);
+        if (mcp && !mcpValue)
         {
           const double notches = fabs(delta) / 120.0;
           g_mcpWheelPt = m->pt; // remembered while the gesture runs; see ApplyMcpWheel
@@ -3265,7 +3638,6 @@ static RECT g_groupRect = {0, 0, 0, 0}; // the whole block, drawn as ONE outer f
 static HBRUSH g_cardBrush = nullptr;
 static HBRUSH g_lineBrush = nullptr;
 static HBRUSH g_gridBrush = nullptr; // faint ticks inside the curve
-static RECT g_headRect = {0, 0, 0, 0};
 static RECT g_sepRect = {0, 0, 0, 0}; // thin rule under the master switch
 static bool g_hasCards = false;
 // (Re)create the three solid brushes from the current theme colours. Kept in one place
@@ -3943,10 +4315,6 @@ static LRESULT CALLBACK FaderProc(HWND h, UINT msg, WPARAM wp, LPARAM lp)
 // One knob's spec: where its value lives and the range it covers. The type itself and the
 // arrays it fills are declared up with the sliders, so the value mapping can use them.
 
-// The knob's slot in the curve's joint array: [0] is the Start knob, then Accel/Hold/Coast/
-// Release, i.e. the same order. Kept as a function so the two never drift apart.
-static int KnobCurveSlot(int knobIdx) { return knobIdx; }
-
 static double KnobValue(int i)
 {
   const KnobSpec &k = g_knobs[i];
@@ -4326,7 +4694,6 @@ static void LayoutControls(HWND h)
   RECT rc;
   GetClientRect(h, &rc);
   const int w = rc.right;
-  const int cw = w - m.pad * 2;
 
   // Vertical: the rows keep their compact spacing and start at the top. The panel is
   // NOT stretched to fill a taller window (the groups would drift apart and lose their
@@ -5784,6 +6151,46 @@ static void DumpMouseModifiers(const char *why)
   }
 }
 
+// Which actions exist, and what REAPER calls them.
+//
+// Built because a macro's child ids are NOT the ids this plugin's table lists, so the only way to
+// learn what a macro actually contains is to ask REAPER for the names. And the question "does a
+// MIDI-CC-only action have a separate wheel-relative twin, or is it the same action?" can only be
+// answered by looking at what exists: both families are dumped with their ids, so the two can be
+// compared directly instead of assumed to differ.
+//
+// Only compiled into the debug build. Read-only: it enumerates, it never runs or changes anything.
+static void DumpActionNames(const char *why)
+{
+  (void)why; // only used by the debug build's log lines
+#ifdef SWS_DEBUG_LOG
+  if (!kbd_enumerateActions || !SectionFromUniqueID)
+    return;
+  KbdSectionInfo *sec = SectionFromUniqueID(kSectionMain);
+  if (!sec)
+    return;
+  int shown = 0;
+  for (int i = 0;; ++i)
+  {
+    const char *nm = nullptr;
+    const int id = kbd_enumerateActions(sec, i, &nm);
+    if (id == 0 && !nm)
+      break; // end of the list
+    if (id <= 0 || !nm)
+      continue;
+    // Everything wheel-ish, plus the zoom/scroll names, is what the macro question needs.
+    const bool interesting = strstr(nm, "mousewheel") || strstr(nm, "MIDI CC") ||
+                             strstr(nm, "OSC only") || strstr(nm, "Zoom") || strstr(nm, "Scroll");
+    if (!interesting)
+      continue;
+    Log("ACTION %s id=%d \"%s\"", why, id, nm);
+    if (++shown > 400)
+      break; // a guard, not a limit anyone should reach
+  }
+  Log("ACTION %s: %d listed", why, shown);
+#endif
+}
+
 // REAPER_PLUGIN_DLL_EXPORT is the SDK's own per-platform export attribute
 // (reaper_plugin.h: __declspec(dllexport) on Windows, default-visibility
 // __attribute__ elsewhere) -- use it rather than inventing a second one.
@@ -5828,13 +6235,17 @@ extern "C" REAPER_PLUGIN_DLL_EXPORT int ReaperPluginEntry(HINSTANCE hInst, reape
 
   // Reported to REAPER (and shown in its Extensions list). Keep in step with the
   // version in versions/ and the GitHub release tag.
-  rec->Register("ext_name", (void *)"Smooth Wheel Scroll 1.7.0");
+  rec->Register("ext_name", (void *)"Smooth Wheel Scroll 1.7.2");
   rec->Register("ext_vendor", (void *)"SmoothWheelScroll");
 
   // Load the saved feel before anything uses it. If the master switch was off, the
   // hook still gets installed (see InstallHook) so it can be switched back on at
   // runtime, and until then every wheel is forwarded untouched.
   LoadSettings();
+
+  // Point each axis at its macro child spec array (see the note on Integrator::macroChild). Without
+  // this the macro path would see a null pointer and refuse every macro.
+  BindMacroChildArrays();
 
 #ifdef _WIN32
   // Windows' default timer granularity is ~15.6 ms, coarser than g_releaseMs, so
@@ -5869,6 +6280,7 @@ extern "C" REAPER_PLUGIN_DLL_EXPORT int ReaperPluginEntry(HINSTANCE hInst, reape
   rec->Register("atexit", (void *)OnExit);
 
   DumpMouseModifiers("load");
+  DumpActionNames("load"); // which actions exist and what they are called (debug build only)
 
   Log("loaded main=%p", (void *)g_main);
   return 1;

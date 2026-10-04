@@ -1,7 +1,7 @@
 # Porting to Linux / macOS
 
 Status: Linux v1 (action-based glide, no settings UI) builds and is under
-live testing, rebased onto upstream 1.7.0. Settings window Phase 2a (empty,
+live testing, rebased onto upstream 1.7.2. Settings window Phase 2a (empty,
 themed, open/closable panel) is live-tested on the `settings-ui-port` branch
 -- see below. macOS not started (no Windows-hook-equivalent code exists yet
 on either platform -- see below).
@@ -590,6 +590,51 @@ this phase), and the user confirmed "SmoothScroll..." now appears and opens
 the panel. Temporary trace logging removed afterward; `unifdef -D_WIN32`
 re-confirmed the Windows path is still byte-for-byte identical to
 `linux-port`.
+
+## Rebased onto upstream 1.7.1 / 1.7.2 (macros, mixer guard)
+
+Two upstream feature releases since the 1.7.0 rebase, pulled in together
+(merge-base `4c374f6`, theirs `f6a7411` = v1.7.2):
+
+- **1.7.1 -- `Custom:` macros**: a wheel gesture on a REAPER custom macro
+  (an action whose name starts with `Custom:`) now plays as one animated
+  gesture instead of a burst of raw wheel events replayed per child action.
+  The implementation is `src/macro.h`, which is pure REAPER-free string/data
+  code like `routing.h` and `device.h` before it -- no platform guards
+  needed, it compiles as-is on Linux. The macro chain runs through the same
+  `hookcommand2` + replay path the port already had, so the feature is live
+  on Linux unchanged. Upstream's `DumpActionNames` debug helper came along
+  with it; it lives under `SWS_DEBUG_LOG`, which the port already has.
+- **1.7.2 -- mixer faders/knobs keep their own wheel**: upstream added a
+  guard so that wheel input over mixer *faders/knobs* (as opposed to the
+  mixer background) is no longer captured for smoothing and is left to
+  REAPER natively. That guard lives in the Win32 message-hook code
+  (`GetMsgProc`), which does not compile on Linux -- and the whole MCP
+  surface it guards was never ported in the first place (see the 1.7.0
+  rebase section: mixer wheel forwarding is stubbed and unreachable). So
+  the change is present in the merged source but functionally Windows-only;
+  nothing on the Linux side changes behavior.
+
+Deliberately skipped, same policy as earlier passes: `src/wheel_log.h`,
+`test/check_wheel_log.sh`, `_diag/wheel_log_probe.cpp`, and the build.sh
+`--wheel-log` option (upstream DEV-only raw-wheel logging, not part of the
+shipped plugin), plus documentation-only commits and the `versions/2.0`
+snapshot.
+
+One port-only adjustment was needed: `test/check_macro.sh`'s compile line
+gained `-D_snprintf=snprintf` because the probes include `src/macro.h`
+standalone (the main build already gets the same shim from
+`platform_compat.h`). `src/macro.h` and the probes themselves stay
+byte-identical to upstream.
+
+Verified: `unifdef -D_WIN32 src/smooth_wheel_scroll.cpp` against upstream
+v1.7.2 differs only in the same named categories as before (skipped
+wheel-log code, port comments, `REAPER_PLUGIN_DLL_EXPORT`, declaration
+order) -- no Windows behavior change. Both `./build-linux.sh` and
+`./build-linux.sh --no-settings-ui` build clean, and all eight test gates
+pass, including the new `test/check_macro.sh`. Our build.sh linker line
+(`-luser32 -lgdi32 -lole32 -lwinmm -lcomctl32`) is unchanged; upstream's
+`--wheel-log` build option was not adopted.
 
 ## macOS
 
